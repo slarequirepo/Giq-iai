@@ -1,0 +1,80 @@
+@import "tailwindcss";
+
+@theme {
+  --color-brand: #ffffff;
+  --color-brand-muted: #8e8ea0;
+  --color-gpt-bg: #212121;
+  --color-gpt-sidebar: #171717;
+  --color-gpt-input: #2f2f2f;
+  --color-gpt-text: #ececec;
+}
+
+:root {
+  background-color: #212121;
+  color: #ececec;
+  font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, "Noto Sans", sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol", "Noto Color Emoji";
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  height: 100vh;
+  background-color: #212121;
+}
+
+/* Markdown prose overrides for dark mode */
+.prose-invert {
+  --tw-prose-body: #ececec;
+  --tw-prose-headings: #ffffff;
+  --tw-prose-links: #ffffff;
+  --tw-prose-bold: #ffffff;
+  --tw-prose-counters: #8e8ea0;
+  --tw-prose-bullets: #8e8ea0;
+  --tw-prose-hr: #ffffff1a;
+  --tw-prose-quotes: #ececec;
+  --tw-prose-quote-borders: #ffffff1a;
+  --tw-prose-captions: #8e8ea0;
+  --tw-prose-code: #ffffff;
+  --tw-prose-pre-code: #ececec;
+  --tw-prose-pre-bg: #0d0d0d;
+  --tw-prose-th-borders: #ffffff1a;
+  --tw-prose-td-borders: #ffffff1a;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #ffffff1a;
+  border-radius: 10px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #ffffff33;
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+
+/* Animations */
+@keyframes pulse-slow {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.8; transform: scale(0.98); }
+}
+
+.animate-pulse-slow {
+  animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}
+
+/* Chat Input Focus */
+textarea:focus {
+  outline: none;
+}
