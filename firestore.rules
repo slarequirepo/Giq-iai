@@ -1,0 +1,118 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Default deny
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Helpers
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isSignedIn() && request.auth.uid == userId;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isMember(groupId) {
+      return isSignedIn() && exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    // User Rules
+    match /users/{userId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn() && resource.data.uid == request.auth.uid; // Limit query
+      
+      function isValidUser(data) {
+        return data.keys().hasAll(['uid', 'email', 'displayName', 'photoURL', 'createdAt']) &&
+               data.keys().size() == 5 &&
+               data.uid == request.auth.uid &&
+               data.email is string &&
+               data.displayName is string &&
+               data.photoURL is string &&
+               data.createdAt == request.time;
+      }
+
+      allow create: if isOwner(userId) && isValidUser(incoming());
+      allow update: if isOwner(userId) && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['displayName', 'photoURL']) &&
+                      incoming().displayName is string &&
+                      incoming().photoURL is string;
+    }
+
+    // Group Rules
+    match /groups/{groupId} {
+      allow get: if isSignedIn();
+      allow list: if isSignedIn(); // We might want to browse groups
+
+      function isValidGroup(data) {
+        return data.keys().hasAll(['name', 'description', 'createdBy', 'createdAt']) &&
+               data.keys().size() == 4 &&
+               data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+               data.description is string && data.description.size() <= 500 &&
+               data.createdBy == request.auth.uid &&
+               data.createdAt == request.time;
+      }
+
+      allow create: if isSignedIn() && isValidId(groupId) && isValidGroup(incoming()) &&
+                    // Ensure the creator also creates their membership in the same atomic batch (using existsAfter/getAfter)
+                    existsAfter(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+      
+      allow update: if isMember(groupId) && 
+                      incoming().diff(existing()).affectedKeys().hasOnly(['name', 'description']) &&
+                      incoming().name is string && incoming().name.size() <= 100 &&
+                      incoming().description is string && incoming().description.size() <= 500;
+      
+      // Members Subcollection
+      match /members/{memberId} {
+        allow read: if isMember(groupId);
+        
+        function isValidMember(data) {
+          return data.keys().hasAll(['userId', 'joinedAt', 'role']) &&
+                 data.keys().size() == 3 &&
+                 data.userId == memberId &&
+                 data.userId == request.auth.uid &&
+                 data.joinedAt == request.time &&
+                 data.role == 'owner'; // Only owner for initial join or similar
+        }
+
+        // Creators must be owners. Others can join as members.
+        allow create: if isSignedIn() && isValidId(memberId) &&
+                      (
+                        // Creating during group creation
+                        (getAfter(/databases/$(database)/documents/groups/$(groupId)).data.createdBy == request.auth.uid && memberId == request.auth.uid) ||
+                        // Regular join
+                        (memberId == request.auth.uid && incoming().role == 'member')
+                      );
+      }
+
+      // Messages Subcollection
+      match /messages/{messageId} {
+        allow read: if isMember(groupId);
+        
+        function isValidMessage(data) {
+          return data.keys().hasAll(['content', 'senderId', 'senderName', 'senderPhoto', 'timestamp']) &&
+                 data.keys().size() == 5 &&
+                 data.content is string && data.content.size() > 0 && data.content.size() <= 2000 &&
+                 data.senderId == request.auth.uid &&
+                 data.timestamp == request.time;
+        }
+
+        allow create: if isMember(groupId) && isValidId(messageId) && isValidMessage(incoming());
+      }
+    }
+  }
+}
