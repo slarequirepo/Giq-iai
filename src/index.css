@@ -90,6 +90,49 @@ body::before {
   animation: pulse-slow 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
 }
 
+@keyframes reveal-text {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes cursor-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@keyframes pulse-status {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.streaming-container {
+  position: relative;
+}
+
+/* Status message style while thinking */
+.status-thinking {
+  font-style: italic;
+  color: #9ca3af;
+  animation: pulse-status 2s ease-in-out infinite;
+}
+
+/* Shimmer that follows the end of the text (approximate) */
+.streaming-container p {
+  display: inline;
+  line-height: 1.6;
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.2em;
+  background: white;
+  margin-left: 2px;
+  vertical-align: middle;
+  animation: cursor-blink 0.8s infinite;
+  box-shadow: 0 0 8px rgba(255, 255, 255, 0.8);
+}
+
 /* Chat Input Focus */
 textarea:focus {
   outline: none;

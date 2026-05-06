@@ -4,7 +4,6 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, Part } from "@google/genai";
 import Markdown from 'react-markdown';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
 import { shadesOfPurple } from 'react-syntax-highlighter/dist/esm/styles/prism';
@@ -29,12 +28,17 @@ import {
   Trash2,
   Share,
   PlayCircle,
-  Image as ImageIcon
+  Video,
+  Image as ImageIcon,
+  Eye,
+  Copy,
+  Check,
+  Layout
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-
-// Initialize Gemini
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+import JSZip from 'jszip';
+import VideoProcessingLab from './components/VideoProcessingLab';
+import { geminiService } from './services/geminiService';
 
 import { 
   auth, 
@@ -66,15 +70,23 @@ import {
   writeBatch
 } from 'firebase/firestore';
 
+interface FileUpload {
+  file: File;
+  preview: string;
+}
+
 interface Message {
   role: 'user' | 'assistant' | 'group';
   content: string;
   id: string;
+  imageUrl?: string;
+  videoUrl?: string;
   senderId?: string;
   senderName?: string;
   senderPhoto?: string;
   timestamp?: any;
-  files?: { name: string, type: string }[];
+  files?: { name: string, type: string, url: string }[];
+  isThinking?: boolean;
 }
 
 interface Group {
@@ -105,24 +117,40 @@ export default function App() {
   const [deepSearch, setDeepSearch] = useState(false);
   const [language, setLanguage] = useState('Português');
   const [tokenUsage, setTokenUsage] = useState(0);
+  const [previewCode, setPreviewCode] = useState<{ code: string, lang: string } | null>(null);
+  const [showVideoLab, setShowVideoLab] = useState(false);
   
   const chatEndRef = useRef<HTMLDivElement>(null);
+  const mediaInputRef = useRef<HTMLInputElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     testConnection();
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        // Sync user to Firestore
+        // Sync user to Firestore - Efficient Sync
         const userRef = doc(db, 'users', u.uid);
         try {
-          await setDoc(userRef, {
-            uid: u.uid,
-            displayName: u.displayName,
-            email: u.email,
-            photoURL: u.photoURL,
-            createdAt: serverTimestamp()
-          }, { merge: true });
+          const userSnap = await getDoc(userRef);
+          if (!userSnap.exists()) {
+            await setDoc(userRef, {
+              uid: u.uid,
+              displayName: u.displayName,
+              email: u.email,
+              photoURL: u.photoURL,
+              createdAt: serverTimestamp()
+            });
+          } else {
+            // Check if updates are needed (optional, but good for profile sync)
+            const data = userSnap.data();
+            if (data.photoURL !== u.photoURL || data.displayName !== u.displayName) {
+              await setDoc(userRef, {
+                displayName: u.displayName,
+                photoURL: u.photoURL,
+              }, { merge: true });
+            }
+          }
         } catch (err) {
           console.error("Sync user error:", err);
         }
@@ -165,10 +193,13 @@ export default function App() {
           id: d.id,
           role: 'group',
           content: data.content,
+          imageUrl: data.imageUrl,
+          videoUrl: data.videoUrl,
           senderId: data.senderId,
           senderName: data.senderName,
           senderPhoto: data.senderPhoto,
-          timestamp: data.timestamp
+          timestamp: data.timestamp,
+          files: data.files
         } as Message;
       });
       setGroupMessages(msgs);
@@ -249,119 +280,135 @@ export default function App() {
         return;
       }
       try {
-        // Ensure user is member before sending (or syncly join)
-        const memberRef = doc(db, 'groups', activeGroup.id, 'members', user.uid);
-        const memberSnap = await getDoc(memberRef);
-        if (!memberSnap.exists()) {
-          await setDoc(memberRef, {
-            userId: user.uid,
-            joinedAt: serverTimestamp(),
-            role: 'member'
-          });
-        }
-
+        const memberRef = doc(db, 'users', user.uid); // Check membership via doc
         const msgPath = `groups/${activeGroup.id}/messages`;
+        const firstImage = files.find(f => f.file.type.startsWith('image/'))?.preview;
+        const firstVideo = files.find(f => f.file.type.startsWith('video/'))?.preview;
+
         await addDoc(collection(db, msgPath), {
           content: finalInput,
           senderId: user.uid,
           senderName: user.displayName || user.email,
           senderPhoto: user.photoURL,
-          timestamp: serverTimestamp()
+          timestamp: serverTimestamp(),
+          imageUrl: firstImage || null,
+          videoUrl: firstVideo || null,
+          files: files.map(f => ({ name: f.file.name, type: f.file.type, url: f.preview }))
         });
         setUserInput('');
+        setFiles([]);
       } catch (error) {
         handleFirestoreError(error, OperationType.WRITE, `groups/${activeGroup.id}/messages`);
       }
       return;
     }
 
+    const uniqueId = () => `id-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
+
     const userMessage: Message = { 
       role: 'user', 
       content: finalInput, 
-      id: Date.now().toString(),
-      files: files.map(f => ({ name: f.file.name, type: f.file.type }))
+      id: uniqueId(),
+      imageUrl: files.find(f => f.file.type.startsWith('image/'))?.preview,
+      videoUrl: files.find(f => f.file.type.startsWith('video/'))?.preview,
+      files: files.map(f => ({ name: f.file.name, type: f.file.type, url: f.preview }))
     };
 
     setMessages(prev => [...prev, userMessage]);
     setUserInput('');
+    setFiles([]);
     setIsGenerating(true);
 
     try {
-      const history = messages.slice(-memoryLimit).map(msg => ({
-        role: msg.role === 'assistant' ? 'model' : 'user',
-        parts: [{ text: msg.content }]
-      }));
+      const isGenerateImageRequest = activePersona === 'Designer' || 
+        finalInput.toLowerCase().includes('thumbnail') ||
+        finalInput.toLowerCase().includes('miniatura') ||
+        finalInput.toLowerCase().includes('capa de') ||
+        finalInput.toLowerCase().includes('gere uma imagem') || 
+        finalInput.toLowerCase().includes('generate an image');
 
-      const parts: Part[] = [{ text: finalInput }];
+      if (isGenerateImageRequest) {
+        const assistantMessageId = uniqueId();
+        setMessages(prev => [...prev, { 
+          role: 'assistant', 
+          content: '🎨 Projetando thumbnail de alta performance...', 
+          id: assistantMessageId,
+          isThinking: true
+        }]);
 
-      for (const f of files) {
-        const base64Data = await new Promise<string>((resolve) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve((reader.result as string).split(',')[1]);
-          reader.readAsDataURL(f.file);
-        });
-        parts.push({
-          inlineData: {
-            mimeType: f.file.type,
-            data: base64Data
+        try {
+          const imageUrl = await geminiService.generateThumbnail(finalInput);
+
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMessageId 
+              ? { ...msg, content: 'Aqui está a sua arte profissional:', imageUrl: imageUrl, isThinking: false } 
+              : msg
+          ));
+          setIsGenerating(false);
+          return;
+        } catch (imgErr: any) {
+          console.error("AI Image Error:", imgErr);
+          let userFriendlyError = imgErr.message;
+          if (imgErr.message?.includes('429') || imgErr.message?.includes('LIMITE_COTA') || JSON.stringify(imgErr).includes('429')) {
+             userFriendlyError = "Limite de Cota Atingido. O servidor de imagens da IA está temporariamente ocupado. Por favor, tente novamente em 1 minuto.";
           }
-        });
-      }
-
-      setFiles([]);
-
-      const personas: Record<string, string> = {
-        'Platinum': 'Você é o React Platinum CORE. Respostas de elite, técnicas e equilibradas.',
-        'Codificador': 'Foque exclusivamente em código. Responda apenas com snippets comentados e explicações de arquitetura.',
-        'Criativo': 'Seja poético, use metáforas e gere ideias inovadoras fora da caixa.',
-        'Streamer': 'Aja como um Streamer React hiper-enérgico. Use gírias da internet, exclamações e analise mídia com empolgação total.',
-        'Cientista': 'Postura acadêmica. Cite conceitos teóricos, use linguagem formal e dados estruturados.',
-      };
-
-      const systemPrompt = `Você é o sistema de IA operando sob o perfil: ${personas[activePersona]}.
-      IDIOMA DE RESPOSTA PRIORITÁRIO: ${language}.
-      ESTILO DE RESPOSTA ATUAL: ${activePersona.toUpperCase()}.
-      DEEP SEARCH ATIVADO: ${deepSearch ? 'SIM (Realize buscas mentais extensas e cross-reference informações)' : 'NÃO'}.
-      REGRAS DE OURO:
-      1. Respostas em Markdown de nível editorial.
-      2. Profundidade Técnica de acordo com a persona.
-      3. Código sem erros e documentado.
-      4. Se houver vídeo/imagem, integre a análise visual no contexto da persona escolhida.`;
-      
-      const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [...history, { role: 'user', parts }],
-        config: { 
-          systemInstruction: systemPrompt,
-          temperature: temperature,
+          
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMessageId 
+              ? { ...msg, content: `❌ ${userFriendlyError}`, isThinking: false } 
+              : msg
+          ));
+          setIsGenerating(false);
+          return;
         }
-      });
-
-      let responseText = result.text || "Ops, não consegui processar isso agora.";
-
-      // Simple token estimation
-      const estimatedTokens = responseText.length / 4;
-      setTokenUsage(prev => Math.min(prev + estimatedTokens, 1000000));
-      
-      setMessages(prev => [...prev, { 
-        role: 'assistant', 
-        content: responseText, 
-        id: (Date.now() + 1).toString() 
-      }]);
-
-    } catch (error: any) {
-      console.error(error);
-      let errorMsg = "Houve um erro técnico. Por favor, tente novamente em alguns segundos.";
-      
-      if (error.message?.includes('429')) {
-        errorMsg = "Limite de requisições (Quota) atingido para este modelo. Por favor, aguarde um minuto antes de tentar novamente.";
       }
 
+      const assistantMessageId = uniqueId();
       setMessages(prev => [...prev, { 
         role: 'assistant', 
-        content: errorMsg, 
-        id: Date.now().toString() 
+        content: '⚙️ Pensando...', 
+        id: assistantMessageId,
+        isThinking: true
       }]);
+
+      try {
+        const history = messages.slice(-memoryLimit).map(msg => ({
+          role: msg.role === 'assistant' ? 'assistant' : 'user',
+          content: msg.content
+        }));
+
+        const stream = geminiService.chatStream({
+          prompt: finalInput,
+          history,
+          persona: activePersona,
+          language,
+          deepSearch
+        });
+
+        let fullContent = '';
+
+        setMessages(prev => prev.map(msg => 
+          msg.id === assistantMessageId ? { ...msg, isThinking: false, content: '' } : msg
+        ));
+
+        for await (const chunk of stream) {
+          fullContent += chunk;
+          
+          setMessages(prev => prev.map(msg => 
+            msg.id === assistantMessageId ? { ...msg, content: fullContent } : msg
+          ));
+        }
+
+        setIsGenerating(false);
+      } catch (err: any) {
+        console.error("AI Chat Error:", err);
+        setMessages(prev => prev.map(msg => 
+          msg.id === assistantMessageId 
+            ? { ...msg, content: `❌ Erro no Processamento: ${err.message}`, isThinking: false } 
+            : msg
+        ));
+        setIsGenerating(false);
+      }
     } finally {
       setIsGenerating(false);
     }
@@ -407,14 +454,27 @@ export default function App() {
       >
         <div className="p-4 flex items-center justify-between border-b border-white/5 bg-[#1a1a1a]">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-lg bg-white flex items-center justify-center">
-              <Sparkles size={18} className="text-black" />
+            <div className="relative">
+              <div className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_10px_#10b981]" />
+              <div className="absolute inset-0 w-2.5 h-2.5 rounded-full bg-emerald-500 animate-ping opacity-75" />
             </div>
-            <span className="font-black text-[10px] uppercase tracking-[0.2em]">{aiName} HUB</span>
+            <div>
+              <h1 className="text-[10px] font-black tracking-widest text-white uppercase italic">REACT AI LABS</h1>
+              <p className="text-[8px] text-gray-500 font-bold uppercase tracking-[0.2em] -mt-0.5">Proprietary Engine v4.8</p>
+            </div>
           </div>
-          <button onClick={() => setIsSidebarOpen(false)} className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-white transition-colors">
-            <X size={20} />
-          </button>
+          <div className="flex items-center gap-2">
+            <a 
+              href="/api/info" 
+              target="_blank"
+              className="px-2 py-1 bg-emerald-500/10 hover:bg-emerald-500/20 text-emerald-400 text-[8px] font-black rounded border border-emerald-500/20 transition-all font-mono"
+            >
+              SYS INFO
+            </a>
+            <button onClick={() => setIsSidebarOpen(false)} className="p-2 hover:bg-white/5 rounded-lg text-gray-500 hover:text-white transition-colors">
+              <X size={20} />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto px-4 py-6 space-y-8 custom-scrollbar">
@@ -462,7 +522,7 @@ export default function App() {
                 <div className="space-y-3">
                   <span className="text-[10px] font-black text-gray-500 tracking-widest text-center block">PERSONA ATIVA</span>
                   <div className="grid grid-cols-1 gap-2">
-                    {['Platinum', 'Codificador', 'Criativo', 'Streamer', 'Cientista'].map(p => (
+                    {['Platinum', 'Codificador', 'Criativo', 'Designer', 'Streamer', 'Cientista'].map(p => (
                       <button
                         key={p}
                         onClick={() => setActivePersona(p)}
@@ -585,6 +645,22 @@ export default function App() {
           </div>
 
           {/* LABS / EXPERIMENTAL */}
+          <div className="space-y-3">
+            <div className="text-[10px] uppercase text-emerald-500/30 font-black px-1 tracking-[0.2em]">Video Studio Pro</div>
+            <button 
+              onClick={() => setShowVideoLab(true)}
+              className="w-full p-4 bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 rounded-2xl flex items-center gap-3 group transition-all"
+            >
+              <div className="p-2 bg-emerald-500/20 rounded-xl group-hover:bg-emerald-500/40 transition-colors">
+                <Video size={18} className="text-emerald-500" />
+              </div>
+              <div className="text-left">
+                <p className="text-[10px] font-black text-white uppercase tracking-widest">AI Video Lab</p>
+                <p className="text-[8px] text-emerald-500/60 font-bold uppercase tracking-widest">Editor de Frames</p>
+              </div>
+            </button>
+          </div>
+
           <div className="space-y-3 pb-8">
             <div className="text-[10px] uppercase text-amber-500/30 font-black px-1 tracking-[0.2em]">Platinum Labs</div>
             <div className="grid grid-cols-2 gap-2">
@@ -634,6 +710,11 @@ export default function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 flex flex-col h-full bg-[#212121] relative min-w-0">
+        {/* Video Lab Modal */}
+        <AnimatePresence>
+          {showVideoLab && <VideoProcessingLab onClose={() => setShowVideoLab(false)} />}
+        </AnimatePresence>
+
         {/* Header */}
         <header className="h-14 flex items-center justify-between px-4 sticky top-0 z-20">
           <div className="flex items-center gap-2">
@@ -646,7 +727,7 @@ export default function App() {
               </button>
             )}
             <div className="flex items-center gap-2 font-black text-xl text-white tracking-tighter italic">
-              {activeGroup ? activeGroup.name : aiName} <span className="not-italic text-[10px] bg-white px-2 py-0.5 rounded-full font-bold text-black ml-1 uppercase">{activeGroup ? 'GROUP' : 'PLATINUM'}</span>
+              {activeGroup ? activeGroup.name : "REACT LABS"} <span className="not-italic text-[10px] bg-emerald-500 px-2 py-0.5 rounded-md font-black text-black ml-1 uppercase">{activeGroup ? 'GROUP' : 'OWN-AI'}</span>
             </div>
           </div>
           
@@ -735,6 +816,19 @@ export default function App() {
                           </div>
                         </div>
                       )}
+                      
+                      {msg.imageUrl && (
+                        <div className="mb-4 rounded-xl overflow-hidden border border-white/10">
+                          <img src={msg.imageUrl} alt="media" className="w-full h-auto max-h-60 object-cover" referrerPolicy="no-referrer" />
+                        </div>
+                      )}
+
+                      {msg.videoUrl && (
+                        <div className="mb-4 rounded-xl overflow-hidden border border-white/10 bg-black">
+                          <video src={msg.videoUrl} controls className="w-full h-auto max-h-60" />
+                        </div>
+                      )}
+
                       <div className="text-sm md:text-md">{msg.content}</div>
                       <div className="text-[8px] text-white/20 mt-2 font-black uppercase tracking-widest text-right">
                         {msg.timestamp?.toDate ? msg.timestamp.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '...'}
@@ -760,8 +854,13 @@ export default function App() {
                     className={`flex gap-4 md:gap-6 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
                   >
                     {msg.role === 'assistant' && (
-                      <div className="w-9 h-9 rounded-full bg-white flex items-center justify-center flex-shrink-0 animate-pulse-slow shadow-lg shadow-white/5 border border-white/10">
-                        <Sparkles size={18} className="text-black" />
+                      <div className="w-9 h-9 rounded-full bg-white flex items-center justify-center flex-shrink-0 animate-pulse-slow shadow-lg shadow-white/10 border border-white/10 overflow-hidden relative group">
+                        <img 
+                          src="https://images.unsplash.com/photo-1675271591211-126ad94e495d?auto=format&fit=crop&q=80&w=200&h=200" 
+                          alt="AI" 
+                          className="w-full h-full object-cover"
+                        />
+                        <div className="absolute inset-0 bg-blue-500/20 mix-blend-overlay" />
                       </div>
                     )}
 
@@ -780,41 +879,109 @@ export default function App() {
                       )}
                       
                       <div className="markdown-body prose prose-invert max-w-full">
-                        <Markdown
-                          components={{
-                            code({ node, inline, className, children, ...props }: any) {
-                              const match = /language-(\w+)/.exec(className || '');
-                              return !inline && match ? (
-                                <div className="my-6 group relative rounded-xl overflow-hidden border border-white/10 bg-[#0d0d0d]">
-                                  <div className="bg-[#1a1a1a] px-4 py-2 text-[10px] font-black uppercase text-gray-500 border-b border-white/5 flex justify-between items-center">
-                                    <span>{match[1]}</span>
-                                    <button 
-                                      onClick={() => navigator.clipboard.writeText(String(children))}
-                                      className="hover:text-white transition-colors text-[10px]"
+                        {msg.imageUrl && (
+                          <div className="mb-6 rounded-3xl overflow-hidden border border-white/10 shadow-2xl bg-black/20 group relative">
+                            <img 
+                              src={msg.imageUrl} 
+                              alt="Generated content" 
+                              className="w-full h-auto object-cover max-h-[512px] group-hover:scale-[1.02] transition-transform duration-500"
+                              referrerPolicy="no-referrer"
+                            />
+                            <div className="absolute inset-0 bg-gradient-to-t from-black/60 to-transparent opacity-0 group-hover:opacity-100 transition-opacity flex items-end p-6">
+                              <button 
+                                onClick={() => {
+                                  const link = document.createElement('a');
+                                  link.href = msg.imageUrl!;
+                                  link.download = `creation-${msg.id}.png`;
+                                  link.click();
+                                }}
+                                className="bg-white text-black px-4 py-2 rounded-xl flex items-center gap-2 text-xs font-black uppercase tracking-widest shadow-xl active:scale-95 transition-all"
+                              >
+                                <Zap size={14} /> Download Ultra-HD
+                              </button>
+                            </div>
+                          </div>
+                        )}
+                        {msg.videoUrl && (
+                          <div className="mb-6 rounded-3xl overflow-hidden border border-white/10 shadow-2xl bg-black group relative">
+                            <video 
+                              src={msg.videoUrl} 
+                              controls
+                              className="w-full h-auto max-h-[512px]"
+                            />
+                          </div>
+                        )}
+                        <div className={`${isGenerating && index === messages.length - 1 ? 'streaming-container' : ''} ${msg.isThinking ? 'status-thinking' : ''}`}>
+                          <Markdown
+                            components={{
+                              code({ node, inline, className, children, ...props }: any) {
+                                const match = /language-(\w+)/.exec(className || '');
+                                const lang = match ? match[1] : '';
+                                const isWeb = ['html', 'xml', 'svg', 'jsx', 'tsx'].includes(lang.toLowerCase());
+                                
+                                return !inline && match ? (
+                                  <div className="my-6 group relative rounded-xl overflow-hidden border border-white/10 bg-[#0d0d0d] shadow-2xl">
+                                    <div className="bg-white/5 backdrop-blur-md px-4 py-2.5 flex justify-between items-center border-b border-white/5">
+                                      <div className="flex items-center gap-3">
+                                        <div className="flex gap-1.5">
+                                          <div className="w-2.5 h-2.5 rounded-full bg-red-500/80" />
+                                          <div className="w-2.5 h-2.5 rounded-full bg-yellow-500/80" />
+                                          <div className="w-2.5 h-2.5 rounded-full bg-green-500/80" />
+                                        </div>
+                                        <span className="text-[10px] font-black uppercase tracking-[0.2em] text-gray-400 bg-white/5 px-2 py-0.5 rounded-md border border-white/5 shadow-inner">
+                                          {lang}
+                                        </span>
+                                      </div>
+                                      <div className="flex items-center gap-2">
+                                        {isWeb && (
+                                          <button 
+                                            onClick={() => setPreviewCode({ code: String(children), lang })}
+                                            className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-[10px] font-bold text-gray-400 hover:text-white transition-all transform active:scale-95"
+                                            title="Ver Preview"
+                                          >
+                                            <Eye size={12} /> Preview
+                                          </button>
+                                        )}
+                                        <button 
+                                          onClick={() => {
+                                            navigator.clipboard.writeText(String(children));
+                                          }}
+                                          className="flex items-center gap-1.5 px-3 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-[10px] font-bold text-gray-400 hover:text-white transition-all transform active:scale-95"
+                                        >
+                                          <Copy size={12} /> Copiar
+                                        </button>
+                                      </div>
+                                    </div>
+                                    <SyntaxHighlighter
+                                      style={shadesOfPurple}
+                                      language={lang}
+                                      PreTag="div"
+                                      customStyle={{ 
+                                        padding: '1.5rem', 
+                                        margin: 0, 
+                                        background: 'transparent',
+                                        fontSize: '13px',
+                                        lineHeight: '1.6'
+                                      }}
+                                      {...props}
                                     >
-                                      Copiar
-                                    </button>
+                                      {String(children).replace(/\n$/, '')}
+                                    </SyntaxHighlighter>
                                   </div>
-                                  <SyntaxHighlighter
-                                    style={shadesOfPurple}
-                                    language={match[1]}
-                                    PreTag="div"
-                                    customStyle={{ padding: '1.5rem', margin: 0, background: 'transparent' }}
-                                    {...props}
-                                  >
-                                    {String(children).replace(/\n$/, '')}
-                                  </SyntaxHighlighter>
-                                </div>
-                              ) : (
-                                <code className={`${className} bg-white/10 px-1.5 py-0.5 rounded text-white`} {...props}>
-                                  {children}
-                                </code>
-                              );
-                            },
-                          }}
-                        >
-                          {msg.content}
-                        </Markdown>
+                                ) : (
+                                  <code className={`${className} bg-white/10 px-1.5 py-0.5 rounded text-white`} {...props}>
+                                    {children}
+                                  </code>
+                                );
+                              },
+                            }}
+                          >
+                            {msg.content}
+                          </Markdown>
+                          {isGenerating && index === messages.length - 1 && !msg.isThinking && (
+                            <span className="typing-cursor" />
+                          )}
+                        </div>
                       </div>
                     </div>
 
@@ -893,9 +1060,9 @@ export default function App() {
               <div className="flex items-center pl-2 pb-2">
                 <input
                   type="file"
-                  id="media-attachment"
+                  ref={mediaInputRef}
                   className="hidden"
-                  accept="video/*,image/*"
+                  accept="image/*,video/*"
                   onChange={(e) => {
                     const selected = Array.from(e.target.files || []);
                     setFiles(prev => [...prev, ...selected.map(f => ({ file: f, preview: URL.createObjectURL(f) }))]);
@@ -904,28 +1071,31 @@ export default function App() {
                 />
                 <input
                   type="file"
-                  id="file-attachment"
+                  ref={fileInputRef}
                   className="hidden"
+                  accept=".apk,.rbxl,.zip,.txt,.pdf,.json"
                   onChange={(e) => {
                     const selected = Array.from(e.target.files || []);
                     setFiles(prev => [...prev, ...selected.map(f => ({ file: f, preview: URL.createObjectURL(f) }))]);
                   }}
                   multiple
                 />
-                <label 
-                  htmlFor="media-attachment" 
+                <button 
+                  type="button"
+                  onClick={() => mediaInputRef.current?.click()}
                   className="p-3 text-gray-400 hover:text-white rounded-2xl cursor-pointer hover:bg-white/5 transition-all active:scale-90"
                   title="Abrir Galeria (Vídeos/Fotos)"
                 >
                   <ImageIcon size={20} />
-                </label>
-                <label 
-                  htmlFor="file-attachment" 
+                </button>
+                <button 
+                  type="button"
+                  onClick={() => fileInputRef.current?.click()}
                   className="p-3 text-gray-400 hover:text-white rounded-2xl cursor-pointer hover:bg-white/5 transition-all active:scale-90"
-                  title="Anexar arquivos"
+                  title="Anexar arquivos (.apk, .rbxl, etc)"
                 >
                   <Paperclip size={20} />
-                </label>
+                </button>
               </div>
 
               <textarea
@@ -966,15 +1136,21 @@ export default function App() {
               </div>
             </div>
 
-            <div className="flex justify-center gap-6 mt-4">
-              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-bold hover:text-white cursor-pointer transition-colors">
-                <Sparkles size={12} className="text-white" /> Pro Architecture
+            <div className="flex justify-center flex-wrap gap-4 mt-6">
+              <div 
+                onClick={() => setUserInput("Gere uma thumbnail de Minecraft modo Hardcore survival")}
+                className="flex items-center gap-2 text-[11px] text-gray-500 font-black hover:text-white cursor-pointer transition-all bg-white/5 px-4 py-2 rounded-full border border-white/5 hover:border-white/20"
+              >
+                <ImageIcon size={12} className="text-blue-400" /> Criar Thumbnail Pro
               </div>
-              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-bold hover:text-white cursor-pointer transition-colors">
+              <div 
+                onClick={() => setUserInput("Gere uma imagem de um dragão de neon estilo cyberpunk anime")}
+                className="flex items-center gap-2 text-[11px] text-gray-500 font-black hover:text-white cursor-pointer transition-all bg-white/5 px-4 py-2 rounded-full border border-white/5 hover:border-white/20"
+              >
+                <Sparkles size={12} className="text-purple-400" /> Arte Digital
+              </div>
+              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-black hover:text-white cursor-pointer transition-all bg-white/5 px-4 py-2 rounded-full border border-white/5 hover:border-white/20">
                 <Globe size={12} /> Deep Search
-              </div>
-              <div className="flex items-center gap-2 text-[11px] text-gray-500 font-bold hover:text-white cursor-pointer transition-colors">
-                <CircleHelp size={12} /> Support
               </div>
             </div>
             
@@ -1015,9 +1191,13 @@ export default function App() {
                     <h3 className="font-bold">Tema do Chat</h3>
                     <p className="text-xs text-gray-500">Alterne entre modos de visualização</p>
                   </div>
-                  <select className="bg-[#2f2f2f] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-0">
-                    <option>Escuro (Padrão)</option>
-                    <option>Sistemas React</option>
+                  <select 
+                    value={uiStyle}
+                    onChange={(e) => setUiStyle(e.target.value)}
+                    className="bg-[#2f2f2f] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-0 outline-none"
+                  >
+                    <option value="Cyber">Neo Cyber</option>
+                    <option value="Minimal">Minimalista</option>
                   </select>
                 </div>
 
@@ -1026,18 +1206,103 @@ export default function App() {
                     <h3 className="font-bold">Modelo de Linguagem</h3>
                     <p className="text-xs text-gray-500">Escolha o cérebro da sua IA</p>
                   </div>
-                  <select className="bg-[#2f2f2f] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-0">
-                    <option>React AI Pro (1.5 Pro)</option>
-                    <option>React AI Express (1.5 Flash)</option>
+                  <select 
+                    value={activePersona}
+                    onChange={(e) => setActivePersona(e.target.value)}
+                    className="bg-[#2f2f2f] border border-white/10 rounded-lg px-3 py-2 text-sm focus:ring-0 outline-none"
+                  >
+                    <option value="Platinum">React AI Platinum (3.0 Pro)</option>
+                    <option value="Designer">React Designer Mode</option>
                   </select>
                 </div>
 
                 <div className="pt-4 flex justify-between items-center text-xs text-gray-500 border-t border-white/5">
-                  <span>Versão 4.6.0-stable</span>
+                  <span>Versão 4.8.2-stable</span>
                   <button className="text-white hover:underline flex items-center gap-1">
                     Ver logs de atualização <ChevronRight size={12} />
                   </button>
                 </div>
+              </div>
+            </motion.div>
+          </div>
+        )}
+
+        {previewCode && (
+          <div className="fixed inset-0 z-[110] flex items-center justify-center p-4">
+            <motion.div
+              initial={{ opacity: 0 }}
+              animate={{ opacity: 1 }}
+              exit={{ opacity: 0 }}
+              onClick={() => setPreviewCode(null)}
+              className="absolute inset-0 bg-black/90 backdrop-blur-md"
+            />
+            <motion.div
+              initial={{ scale: 0.9, opacity: 0, y: 20 }}
+              animate={{ scale: 1, opacity: 1, y: 0 }}
+              exit={{ scale: 0.9, opacity: 0, y: 20 }}
+              className="relative w-full max-w-5xl h-[80vh] bg-white rounded-3xl overflow-hidden shadow-[0_0_100px_rgba(255,255,255,0.1)] flex flex-col"
+            >
+              <div className="bg-[#f5f5f5] px-6 py-4 flex items-center justify-between border-b border-gray-200">
+                <div className="flex items-center gap-4">
+                  <div className="flex gap-2">
+                    <div className="w-3 h-3 rounded-full bg-[#ff5f57]" />
+                    <div className="w-3 h-3 rounded-full bg-[#febc2e]" />
+                    <div className="w-3 h-3 rounded-full bg-[#28c840]" />
+                  </div>
+                  <h3 className="text-black font-bold text-sm uppercase tracking-widest flex items-center gap-2">
+                    <Layout size={16} /> Live Preview: <span className="text-gray-500">{previewCode.lang}</span>
+                  </h3>
+                </div>
+                <button 
+                  onClick={() => setPreviewCode(null)}
+                  className="bg-black/5 hover:bg-black/10 text-black p-2 rounded-xl transition-all active:scale-90"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+              
+              <div className="flex-1 bg-white relative">
+                <iframe
+                  srcDoc={
+                    previewCode.code.includes('<html') 
+                      ? previewCode.code 
+                      : `
+                        <!DOCTYPE html>
+                        <html>
+                          <head>
+                            <meta charset="utf-8">
+                            <style>
+                              body { 
+                                font-family: sans-serif; 
+                                margin: 0; 
+                                padding: 20px; 
+                                background: white; 
+                                color: black; 
+                              }
+                            </style>
+                          </head>
+                          <body>
+                            ${previewCode.code}
+                            <script>
+                              // Basic error handling for the preview
+                              window.onerror = function(msg, url, line) {
+                                document.body.innerHTML += '<div style="color:red;margin-top:20px;padding:10px;border:1px solid red;font-size:12px;">Error: ' + msg + '</div>';
+                              };
+                            </script>
+                          </body>
+                        </html>
+                      `
+                  }
+                  title="Preview"
+                  className="w-full h-full border-none"
+                  sandbox="allow-scripts"
+                />
+              </div>
+              
+              <div className="bg-[#f5f5f5] p-4 flex justify-center border-t border-gray-200">
+                <p className="text-[10px] text-gray-400 font-medium tracking-tight">
+                  Ambiente de execução isolado • React AI Preview Engine
+                </p>
               </div>
             </motion.div>
           </div>
