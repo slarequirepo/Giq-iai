@@ -1,6 +1,8 @@
 {
   "name": "React IA",
-  "description": "Uma IA que reage aos seus vídeos com humor e estilo Streamer, agora com interface estilo Perplexity.",
+  "description": "Uma IA que reage aos seus vídeos com humor e estilo Streamer, agora com estúdio de geração e remix de vídeos em FPS e design de som.",
   "requestFramePermissions": [],
-  "majorCapabilities": []
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

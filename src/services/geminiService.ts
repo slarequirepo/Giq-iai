@@ -234,25 +234,38 @@ export const geminiService = {
   /**
    * Planeja uma sequência de movimento a partir de uma entrada (imagem ou prompt)
    */
-  async synthesizeImageToVideoPlan(params: { baseImage?: string, prompt: string }) {
-    const prompt = `Você é um Animador de Storyboard AI.
+  async synthesizeImageToVideoPlan(params: { baseImage?: string, prompt: string, frameCount?: number, fps?: number, stylePreset?: string }) {
+    const frameCount = params.frameCount || 8;
+    const fps = params.fps || 10;
+    const style = params.stylePreset || "Cinematic 3D Animation";
+
+    const prompt = `Você é um Animador de Storyboard e Diretor de Fotografia AI Especialista.
     
-    MISSÃO: Criar uma sequência de 10 frames que conte uma micro-história ou movimento fluido.
-    ENTRADA: O usuário quer: "${params.prompt}".
+    MISSÃO: Criar um roteiro coerente de ${frameCount} frames sequenciais para um vídeo em ${fps} FPS.
+    TEMA/PROMPT: "${params.prompt}".
+    ESTILO VISUAL: "${style}".
     
-    REGRAS DE OURO:
-    1. CONSISTÊNCIA: Cada frame deve ser uma evolução leve do anterior para parecer animação.
-    2. DETALHE: Descreva a iluminação e o movimento da câmera em cada frame.
-    3. FORMATO: Prompts em inglês para geração de imagem 8k.
+    REGRAS CRÍTICAS DE CONSISTÊNCIA TEMPORAL (FRAME-BY-FRAME):
+    1. MESMO PERSONAGEM/CENÁRIO: Mantenha cores, roupas, iluminação e geometria idênticas em todos os frames.
+    2. DELTA DE MOVIMENTO: Cada frame deve ser uma progressão suave de 1/${fps} segundos do frame anterior.
+    3. PROMPTS EM INGLÊS: Cada prompt deve ser rico em detalhes fotográficos (ex: "8k, high consistency, volumetric light, shot on 35mm lens, master piece").
+    4. SOUND DESIGN: Defina o efeito sonoro (sfx) e nota musical para cada frame.
     
-    RETORNE APENAS JSON:
+    RETORNE APENAS JSON VÁLIDO:
     {
-      "storyTitle": "Título da Animação",
-      "visualStyle": "Estilo visual consistente (ex: Pixar, Cyberpunk, Realismo)",
-      "fps": 10,
+      "storyTitle": "Título do Vídeo",
+      "visualStyle": "${style}",
+      "fps": ${fps},
+      "soundTheme": "cinematic",
+      "soundTrack": "Descrição da vibe musical",
       "frames": [
-        { "id": 1, "prompt": "Prompt detalhado para o frame 1", "action": "Início do movimento" },
-        ... (gere 10 frames)
+        { 
+          "id": 1, 
+          "prompt": "Highly detailed English prompt with style keywords", 
+          "action": "Descrição da ação em português",
+          "camera": "Zoom in / Pan / Static",
+          "sfx": "whoosh / impact / chime / riser / laser"
+        }
       ]
     }`;
 
@@ -279,31 +292,37 @@ export const geminiService = {
   /**
    * Planeja um filme completo com roteiro de imagem e som
    */
-  async synthesizeMoviePlan(params: { prompt: string, baseImage?: string }) {
-    const prompt = `Você é um Diretor de Cinema AI Especialista em Vídeos Curtos (TikTok/Reels/Sora Style).
+  async synthesizeMoviePlan(params: { prompt: string, baseImage?: string, frameCount?: number, fps?: number, stylePreset?: string }) {
+    const frameCount = params.frameCount || 10;
+    const fps = params.fps || 10;
+    const style = params.stylePreset || "Cinematic Masterpiece 8k";
+
+    const prompt = `Você é um Diretor de Cinema AI Especialista em Vídeos Gerados por IA (Sora / Kling / Runway Style).
     
-    MISSÃO: Criar um Master Script para um vídeo de 1 segundo (10 frames) com 10fps.
+    MISSÃO: Criar um Master Script sequencial para um clipe de ${frameCount} frames a ${fps} FPS.
     TEMA: "${params.prompt}".
+    ESTILO VISUAL: "${style}".
     
-    DIRETRIZES:
-    1. CINEMATOGRAFIA: Defina um estilo visual único (ex: Noir, Cyberpunk, Ghibli).
-    2. CONTINUIDADE: Cada frame (0.1s) deve ser uma progressão do anterior.
-    3. SOUND DESIGN: Descreva o efeito sonoro ideal para cada batida/frame.
+    DIRETRIZES TÉCNICAS:
+    1. CONSISTÊNCIA ABSOLUTA: Mesma paleta de cores, mesma luz e mesmo sujeito com pequenas variações de ângulo/pose a cada frame.
+    2. CONTINUIDADE TEMPORAL: Cada frame (frame duration: ${(1/fps).toFixed(2)}s) deve conectar com naturalidade ao próximo.
+    3. SOUND DESIGN SINCRONIZADO: Descreva a trilha musical global e o efeito sonoro de cada batida.
     
-    RETORNE APENAS JSON:
+    RETORNE APENAS JSON VÁLIDO:
     {
       "movieTitle": "Nome do Curta",
-      "cinematicStyle": "Estilo Visual",
-      "lighting": "Esquema de luz",
-      "soundTrack": "Sugestão de gênero musical/vibe sonora",
+      "cinematicStyle": "${style}",
+      "fps": ${fps},
+      "soundTheme": "cyberpunk", 
+      "lighting": "Volumetric dramatic lighting",
+      "soundTrack": "Heavy synth bass with ambient atmospheric pads",
       "frames": [
         { 
           "id": 1, 
-          "prompt": "English prompt for 8k image generation", 
-          "action": "O que acontece na cena", 
-          "sfx": "Descrição do som/efeito neste frame" 
-        },
-        ... (gere 10 frames)
+          "prompt": "Ultra realistic 8k rendering of [subject], consistent lighting, Unreal Engine 5, cinematic depth of field", 
+          "action": "Descrição do movimento da cena", 
+          "sfx": "impact / whoosh / riser / laser / chime" 
+        }
       ]
     }`;
 

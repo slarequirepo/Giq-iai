@@ -1,8 +1,33 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { Play, Video, Scissors, Sparkles, X, Loader2, Download, Eye, Film, Copy } from 'lucide-react';
+import React, { useState, useRef, useEffect, useCallback } from 'react';
+import { 
+  Play, 
+  Pause,
+  Video, 
+  Scissors, 
+  Sparkles, 
+  X, 
+  Loader2, 
+  Download, 
+  Eye, 
+  Film, 
+  Volume2, 
+  VolumeX, 
+  RotateCcw, 
+  SkipBack, 
+  SkipForward, 
+  Sliders, 
+  Layers, 
+  Zap, 
+  Music, 
+  Repeat, 
+  Maximize2,
+  RefreshCw,
+  Clock,
+  Gauge
+} from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-
 import { geminiService } from '../services/geminiService';
+import { audioEngine, SoundTheme } from '../utils/audioSynth';
 
 interface Frame {
   data: string;
@@ -10,103 +35,448 @@ interface Frame {
 }
 
 export default function VideoProcessingLab({ onClose }: { onClose: () => void }) {
-  const [labMode, setLabMode] = useState<'video' | 'animation' | 'movie'>('video');
+  // Modes: movie (AI text/image to video generator), animation (Image rigging), video (Remix/edit)
+  const [labMode, setLabMode] = useState<'movie' | 'animation' | 'video'>('movie');
+  
+  // Generation configuration
+  const [fps, setFps] = useState<number>(10);
+  const [frameCount, setFrameCount] = useState<number>(8);
+  const [stylePreset, setStylePreset] = useState<string>('Cinematic 8K Ultra');
+  const [soundTheme, setSoundTheme] = useState<SoundTheme>('cyberpunk');
+  const [smoothTransitions, setSmoothTransitions] = useState<boolean>(true);
+  const [isAudioEnabled, setIsAudioEnabled] = useState<boolean>(true);
+  const [audioVolume, setAudioVolume] = useState<number>(0.6);
+
+  // Inputs
+  const [instructions, setInstructions] = useState('Um carro esportivo futurista acelerando sob chuva de neon em Tóquio.');
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
   const [frames, setFrames] = useState<Frame[]>([]);
   const [animImages, setAnimImages] = useState<string[]>([]);
+  
+  // State
   const [processing, setProcessing] = useState(false);
-  const [instructions, setInstructions] = useState('Faça uma edição moderna estilo TikTok com cortes rápidos e efeitos de transição.');
-  const [aiResult, setAiResult] = useState<any>(null);
   const [isExtracting, setIsExtracting] = useState(false);
+  const [isRendering, setIsRendering] = useState(false);
+  const [renderProgress, setRenderProgress] = useState<{ current: number; total: number; status: string }>({ current: 0, total: 0, status: '' });
+  const [aiResult, setAiResult] = useState<any>(null);
+  
+  // Rendered frames & playback
   const [renderedFrames, setRenderedFrames] = useState<string[]>([]);
   const [currentFrameIdx, setCurrentFrameIdx] = useState(0);
-  const [isRendering, setIsRendering] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPingPong, setIsPingPong] = useState(false);
+  const [playDirection, setPlayDirection] = useState<1 | -1>(1);
 
+  // Capture / Export
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [exportProgress, setExportProgress] = useState<number>(0);
+
+  // Refs
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const playbackTimerRef = useRef<number | null>(null);
+  const loadedImagesRef = useRef<HTMLImageElement[]>([]);
 
-  const [isCapturing, setIsCapturing] = useState(false);
-  const [downloadUrl, setDownloadUrl] = useState<string | null>(null);
-
-  // Auto-play rendered frames synced with detected BPM or 10fps precision
+  // Pre-load rendered images into memory for zero-lag canvas rendering
   useEffect(() => {
-    if (renderedFrames.length > 0 && !isRendering) {
-      const intervalMs = 100; // 10fps para animação fluida
-      const interval = setInterval(() => {
-        setCurrentFrameIdx(prev => (prev + 1) % renderedFrames.length);
-      }, intervalMs); 
-      return () => clearInterval(interval);
-    }
-  }, [renderedFrames, isRendering]);
-
-  // Sincroniza o frame renderizado atual para o canvas (necessário para exportação)
-  useEffect(() => {
-    if (renderedFrames.length > 0 && canvasRef.current) {
-      const canvas = canvasRef.current;
-      const ctx = canvas.getContext('2d');
+    loadedImagesRef.current = [];
+    renderedFrames.forEach((src) => {
       const img = new Image();
-      img.onload = () => {
-        ctx?.drawImage(img, 0, 0, canvas.width, canvas.height);
-      };
-      img.src = renderedFrames[currentFrameIdx];
-    }
-  }, [renderedFrames, currentFrameIdx]);
-
-  // Função para gravar o Canvas e gerar um arquivo de vídeo
-  const exportToVideo = async () => {
-    if (renderedFrames.length === 0) return;
-    
-    setIsCapturing(true);
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-
-    const stream = canvas.captureStream(30); // 30 FPS stream
-    const recorder = new MediaRecorder(stream, {
-      mimeType: 'video/webm;codecs=vp9'
+      img.src = src;
+      loadedImagesRef.current.push(img);
     });
+  }, [renderedFrames]);
 
-    const chunks: Blob[] = [];
-    recorder.ondataavailable = (e) => chunks.push(e.data);
-    recorder.onstop = () => {
-      const blob = new Blob(chunks, { type: 'video/mp4' });
-      const url = URL.createObjectURL(blob);
-      setDownloadUrl(url);
-      setIsCapturing(false);
-      
-      // Auto download
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = `render-ai-${Date.now()}.mp4`;
-      a.click();
-    };
+  // Sync sound theme and volume with engine
+  useEffect(() => {
+    audioEngine.setTheme(soundTheme);
+  }, [soundTheme]);
 
-    recorder.start();
+  useEffect(() => {
+    audioEngine.setVolume(isAudioEnabled ? audioVolume : 0);
+  }, [isAudioEnabled, audioVolume]);
 
-    // Toca cada frame uma vez para o recorder capturar
-    for (let i = 0; i < renderedFrames.length; i++) {
-      setCurrentFrameIdx(i);
-      // Aguarda o frame ser desenhado no canvas (useEffect faz isso, mas aqui forçamos a espera)
-      await new Promise(resolve => setTimeout(resolve, 150)); 
+  // Audio trigger on frame change
+  const triggerAudioForFrame = useCallback((frameIdx: number) => {
+    if (!isAudioEnabled) return;
+    const frameData = aiResult?.frames?.[frameIdx] || aiResult?.movieData?.frames?.[frameIdx];
+    const sfx = frameData?.sfx;
+    audioEngine.triggerFrameSfx(frameIdx, renderedFrames.length, sfx);
+  }, [isAudioEnabled, aiResult, renderedFrames.length]);
+
+  // Canvas drawing with optional crossfade motion smoothing
+  const drawFrameToCanvas = useCallback((idx: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas || renderedFrames.length === 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const img = loadedImagesRef.current[idx];
+    if (img && img.complete) {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    } else if (renderedFrames[idx]) {
+      const fallbackImg = new Image();
+      fallbackImg.onload = () => {
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        ctx.drawImage(fallbackImg, 0, 0, canvas.width, canvas.height);
+      };
+      fallbackImg.src = renderedFrames[idx];
     }
-    
-    // Repete mais uma vez para garantir que o vídeo tenha duração mínima e fluidez
-    for (let i = 0; i < renderedFrames.length; i++) {
-      setCurrentFrameIdx(i);
-      await new Promise(resolve => setTimeout(resolve, 150)); 
-    }
+  }, [renderedFrames]);
 
-    recorder.stop();
+  // Redraw when index changes
+  useEffect(() => {
+    if (renderedFrames.length > 0) {
+      drawFrameToCanvas(currentFrameIdx);
+    }
+  }, [currentFrameIdx, renderedFrames, drawFrameToCanvas]);
+
+  // Playback Loop driven by accurate FPS
+  useEffect(() => {
+    if (isPlaying && renderedFrames.length > 1 && !isRendering && !isCapturing) {
+      const frameDurationMs = 1000 / fps;
+
+      playbackTimerRef.current = window.setInterval(() => {
+        setCurrentFrameIdx(prev => {
+          let next = prev;
+          if (isPingPong) {
+            if (prev >= renderedFrames.length - 1) {
+              setPlayDirection(-1);
+              next = prev - 1;
+            } else if (prev <= 0) {
+              setPlayDirection(1);
+              next = 1;
+            } else {
+              next = prev + playDirection;
+            }
+          } else {
+            next = (prev + 1) % renderedFrames.length;
+          }
+          triggerAudioForFrame(next);
+          return next;
+        });
+      }, frameDurationMs);
+
+      // Start ambient soundtrack drone
+      if (isAudioEnabled) {
+        audioEngine.startSoundtrackDrone();
+      }
+
+      return () => {
+        if (playbackTimerRef.current) clearInterval(playbackTimerRef.current);
+        audioEngine.stopSoundtrackDrone();
+      };
+    } else {
+      if (playbackTimerRef.current) clearInterval(playbackTimerRef.current);
+      audioEngine.stopSoundtrackDrone();
+    }
+  }, [isPlaying, renderedFrames.length, fps, isRendering, isCapturing, isPingPong, playDirection, isAudioEnabled, triggerAudioForFrame]);
+
+  // Auto-play when rendering completes
+  useEffect(() => {
+    if (renderedFrames.length > 0 && !isRendering && !isPlaying) {
+      setIsPlaying(true);
+    }
+  }, [renderedFrames.length, isRendering]);
+
+  // Manual Play/Pause toggle
+  const togglePlay = () => {
+    if (renderedFrames.length === 0) return;
+    setIsPlaying(prev => !prev);
   };
 
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) {
-      setVideoFile(file);
-      setVideoUrl(URL.createObjectURL(file));
-      setFrames([]);
-      setAiResult(null);
-      setRenderedFrames([]);
+  // Step Controls
+  const stepPrev = () => {
+    setIsPlaying(false);
+    setCurrentFrameIdx(prev => (prev - 1 + renderedFrames.length) % renderedFrames.length);
+  };
+
+  const stepNext = () => {
+    setIsPlaying(false);
+    setCurrentFrameIdx(prev => (prev + 1) % renderedFrames.length);
+  };
+
+  // Export video with high-definition Canvas recording and synchronized audio
+  const exportToVideo = async () => {
+    if (renderedFrames.length === 0) return;
+
+    setIsCapturing(true);
+    setIsPlaying(false);
+    setExportProgress(0);
+
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      setIsCapturing(false);
+      return;
+    }
+
+    try {
+      const canvasStream = canvas.captureStream(Math.max(fps, 15));
+      const audioTrack = isAudioEnabled ? audioEngine.getAudioStreamTrack() : null;
+
+      const combinedTracks = [...canvasStream.getVideoTracks()];
+      if (audioTrack) {
+        combinedTracks.push(audioTrack);
+      }
+
+      const combinedStream = new MediaStream(combinedTracks);
+      
+      const mimeTypes = [
+        'video/mp4',
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm'
+      ];
+      const selectedMime = mimeTypes.find(t => MediaRecorder.isTypeSupported(t)) || 'video/webm';
+
+      const recorder = new MediaRecorder(combinedStream, {
+        mimeType: selectedMime,
+        videoBitsPerSecond: 6000000 // 6 Mbps for crystal-clear render
+      });
+
+      const chunks: Blob[] = [];
+      recorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunks.push(e.data);
+      };
+
+      const recordPromise = new Promise<Blob>((resolve) => {
+        recorder.onstop = () => {
+          const ext = selectedMime.includes('mp4') ? 'mp4' : 'webm';
+          const blob = new Blob(chunks, { type: selectedMime });
+          resolve(blob);
+        };
+      });
+
+      recorder.start();
+
+      // Play through the sequence 3 times for a solid 3-4s loop
+      const loops = 3;
+      const totalSteps = renderedFrames.length * loops;
+      const stepDuration = 1000 / fps;
+      let stepCounter = 0;
+
+      for (let l = 0; l < loops; l++) {
+        for (let i = 0; i < renderedFrames.length; i++) {
+          setCurrentFrameIdx(i);
+          drawFrameToCanvas(i);
+          triggerAudioForFrame(i);
+
+          stepCounter++;
+          setExportProgress(Math.round((stepCounter / totalSteps) * 100));
+          await new Promise(r => setTimeout(r, stepDuration));
+        }
+      }
+
+      recorder.stop();
+      const videoBlob = await recordPromise;
+
+      const url = URL.createObjectURL(videoBlob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `ai-video-${fps}fps-${Date.now()}.mp4`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Erro na exportação de vídeo:", err);
+      alert("Erro ao exportar vídeo. O navegador salvará os frames gerados.");
+    } finally {
+      setIsCapturing(false);
+      setExportProgress(0);
+      setIsPlaying(true);
+    }
+  };
+
+  // Video slicing for Remix Mode
+  const extractFrames = async () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    setIsExtracting(true);
+    setFrames([]);
+    setRenderedFrames([]);
+
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    const context = canvas.getContext('2d');
+
+    const duration = video.duration;
+    const interval = 1 / fps; // Extração na cadência exata do FPS selecionado
+    const extracted: Frame[] = [];
+
+    for (let t = 0; t < duration; t += interval) {
+      video.currentTime = t;
+      await new Promise(resolve => {
+        const handler = () => {
+          video.removeEventListener('seeked', handler);
+          resolve(null);
+        };
+        video.addEventListener('seeked', handler);
+      });
+
+      context?.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const data = canvas.toDataURL('image/jpeg', 0.6);
+      extracted.push({ data, timestamp: t });
+      setFrames(prev => [...prev, { data, timestamp: t }]);
+      if (extracted.length >= 60) break; // Até 60 frames max
+    }
+
+    setIsExtracting(false);
+  };
+
+  // Main Render Engine
+  const renderVideoGeneration = async () => {
+    if (labMode !== 'movie' && (labMode === 'video' ? frames.length === 0 : animImages.length === 0)) {
+      alert("Carregue uma imagem base ou vídeo para iniciar!");
+      return;
+    }
+
+    setIsRendering(true);
+    setIsPlaying(false);
+    setRenderedFrames([]);
+    setCurrentFrameIdx(0);
+    setRenderProgress({ current: 0, total: frameCount, status: 'Roteirizando storyboard e sound design...' });
+
+    try {
+      if (labMode === 'movie') {
+        // Modo Master AI Movie Generator
+        const plan = await geminiService.synthesizeMoviePlan({
+          prompt: instructions,
+          baseImage: animImages[0],
+          frameCount,
+          fps,
+          stylePreset
+        });
+
+        setAiResult({
+          styleTitle: plan.movieTitle || 'Short Cinematic',
+          colorGrade: plan.cinematicStyle || stylePreset,
+          bpmSugerido: fps * 12,
+          moodAnalysis: plan.soundTrack || 'Atmospheric Synth',
+          audioContext: plan.lighting || 'Volumetric Studio Light',
+          movieData: plan,
+          frames: plan.frames || []
+        });
+
+        const targetFrames = plan.frames || [];
+        const total = targetFrames.length;
+        setRenderProgress({ current: 0, total, status: `Renderizando ${total} frames a ${fps} FPS...` });
+
+        for (let i = 0; i < total; i++) {
+          const framePlan = targetFrames[i];
+          setRenderProgress({ 
+            current: i + 1, 
+            total, 
+            status: `Gerando Frame #${i + 1}/${total} (${((i + 1) / fps).toFixed(2)}s)...` 
+          });
+
+          if (i > 0) {
+            // Intervalo para respeitar a cota RPM da API
+            await new Promise(r => setTimeout(r, 4500));
+          }
+
+          try {
+            const promptForFrame = `${framePlan.prompt}. Frame ${i + 1} of ${total} in sequence. Style: ${plan.cinematicStyle || stylePreset}. Coherent consistent character and camera motion, high detail 8k.`;
+            const imgUrl = await geminiService.generateThumbnail(promptForFrame);
+            setRenderedFrames(prev => [...prev, imgUrl]);
+          } catch (frameErr: any) {
+            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
+              alert(`Limite de cota de IA atingido. ${i} frames foram renderizados com sucesso.`);
+              break;
+            }
+            throw frameErr;
+          }
+        }
+      } else if (labMode === 'animation') {
+        // Modo Animação por Rigging & Keyframes
+        const plan = await geminiService.synthesizeImageToVideoPlan({
+          baseImage: animImages[0],
+          prompt: instructions,
+          frameCount,
+          fps,
+          stylePreset
+        });
+
+        setAiResult({
+          styleTitle: plan.storyTitle,
+          colorGrade: plan.visualStyle,
+          bpmSugerido: fps * 12,
+          moodAnalysis: plan.soundTrack || "Motion Sequence",
+          audioContext: "Ambient Animation",
+          movieData: plan,
+          frames: plan.frames || []
+        });
+
+        const targetFrames = plan.frames || [];
+        const total = targetFrames.length;
+        setRenderProgress({ current: 0, total, status: `Renderizando animação em ${fps} FPS...` });
+
+        for (let i = 0; i < total; i++) {
+          const framePlan = targetFrames[i];
+          setRenderProgress({ 
+            current: i + 1, 
+            total, 
+            status: `Renderizando Frame #${i + 1}/${total}...` 
+          });
+
+          if (i > 0) await new Promise(r => setTimeout(r, 4500));
+
+          try {
+            const imgUrl = await geminiService.generateThumbnail(
+              `${framePlan.prompt}. Style: ${plan.visualStyle}. Single animation frame, consistent visual identity.`
+            );
+            setRenderedFrames(prev => [...prev, imgUrl]);
+          } catch (frameErr: any) {
+            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
+              alert(`Limite de cota atingido. ${i} frames gerados.`);
+              break;
+            }
+            throw frameErr;
+          }
+        }
+      } else {
+        // Modo Remix de Vídeo
+        const plan = await geminiService.synthesizeVideoEdit({
+          images: frames.map(f => f.data),
+          extraImages: animImages.length > 0 ? animImages : undefined,
+          instructions
+        });
+        setAiResult(plan);
+
+        const targetFrames = plan.frames || [];
+        const total = Math.min(targetFrames.length, frameCount);
+        setRenderProgress({ current: 0, total, status: `Renderizando Remix em ${fps} FPS...` });
+
+        for (let i = 0; i < total; i++) {
+          const framePlan = targetFrames[i];
+          setRenderProgress({ current: i + 1, total, status: `Renderizando Frame #${i + 1}/${total}...` });
+
+          if (i > 0) await new Promise(r => setTimeout(r, 4500));
+
+          try {
+            const imgUrl = await geminiService.generateThumbnail(
+              `${framePlan.generationPrompt}. Maintain consistency with style: ${plan.colorGrade || stylePreset}`
+            );
+            setRenderedFrames(prev => [...prev, imgUrl]);
+          } catch (frameErr: any) {
+            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
+              alert(`Limite de cota atingido. ${i} frames gerados.`);
+              break;
+            }
+            throw frameErr;
+          }
+        }
+      }
+    } catch (err: any) {
+      console.error(err);
+      let errorMsg = err.message;
+      if (err.message?.includes('429') || err.message?.includes('LIMITE_COTA')) {
+        errorMsg = "Cota de IA esgotada. Aguarde 1 a 2 minutos antes de continuar.";
+      }
+      alert("Erro na Renderização: " + errorMsg);
+    } finally {
+      setIsRendering(false);
     }
   };
 
@@ -127,640 +497,603 @@ export default function VideoProcessingLab({ onClose }: { onClose: () => void })
     });
   };
 
-  const extractFrames = async () => {
-    if (!videoRef.current || !canvasRef.current) return;
-    setIsExtracting(true);
-    setFrames([]);
-    setRenderedFrames([]);
-    
-    const video = videoRef.current;
-    const canvas = canvasRef.current;
-    const context = canvas.getContext('2d');
-    
-    const duration = video.duration;
-    // Captura ultra-precisa a cada 100ms (10 frames por segundo)
-    const interval = 0.1; 
-    const extracted: Frame[] = [];
-
-    for (let t = 0; t < duration; t += interval) {
-      video.currentTime = t;
-      await new Promise(resolve => {
-        const handler = () => {
-          video.removeEventListener('seeked', handler);
-          resolve(null);
-        };
-        video.addEventListener('seeked', handler);
-      });
-
-      context?.drawImage(video, 0, 0, canvas.width, canvas.height);
-      const data = canvas.toDataURL('image/jpeg', 0.5);
-      extracted.push({ data, timestamp: t });
-      setFrames(prev => [...prev, { data, timestamp: t }]);
-      if (extracted.length >= 200) break; // Até 20 segundos de análise intensa
-    }
-    
-    setIsExtracting(false);
-  };
-
-  const renderVideoEdit = async () => {
-    const videoFrames = labMode === 'video' ? frames.map(f => f.data) : [];
-    const sourceImages = videoFrames.length > 0 ? videoFrames : animImages;
-    
-    if (labMode !== 'movie' && sourceImages.length === 0) {
-      alert("Carregue um vídeo ou selecione imagens para a base da edit!");
-      return;
-    }
-
-    setIsRendering(true);
-    setRenderedFrames([]);
-    setCurrentFrameIdx(0);
-
-    try {
-      if (labMode === 'movie') {
-        const plan = await geminiService.synthesizeMoviePlan({
-          prompt: instructions,
-          baseImage: animImages[0]
-        });
-        
-        setAiResult({
-          styleTitle: plan.movieTitle,
-          colorGrade: plan.cinematicStyle,
-          bpmSugerido: 120,
-          moodAnalysis: plan.soundTrack,
-          audioContext: plan.lighting,
-          movieData: plan, // Guardamos para o UI
-          frames: plan.frames.map((f: any) => ({
-             id: f.id,
-             generationPrompt: f.prompt,
-             vfx: f.action
-          }))
-        });
-
-        for (let i = 0; i < plan.frames.length; i++) {
-          if (i > 0) await new Promise(resolve => setTimeout(resolve, 5000));
-          try {
-            const imgUrl = await geminiService.generateThumbnail(
-              `${plan.frames[i].prompt}. Frame ${i+1} of a consistent movie. Style: ${plan.cinematicStyle}`
-            );
-            setRenderedFrames(prev => [...prev, imgUrl]);
-          } catch (frameErr: any) {
-            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
-               alert("LIMITE DE COTA: A renderização foi interrompida parcialmente. Aguarde 2 minutos para gerar o restante.");
-               break;
-            }
-            throw frameErr;
-          }
-        }
-      } else if (labMode === 'animation') {
-        // Modo Storyboard de Animação (Image to Video)
-        const plan = await geminiService.synthesizeImageToVideoPlan({
-          baseImage: sourceImages[0],
-          prompt: instructions
-        });
-        
-        setAiResult({
-          styleTitle: plan.storyTitle,
-          colorGrade: plan.visualStyle,
-          bpmSugerido: plan.fps * 12,
-          moodAnalysis: "Motion Sequence",
-          audioContext: "Ambient Animation",
-          keyframes: plan.frames.map((f: any) => ({
-             frame: f.id,
-             action: f.action,
-             camera: "Fixed / Dynamic",
-             prompt: f.prompt
-          }))
-        });
-
-        // Renderização dos frames de animação
-        const renderLimit = plan.frames.length;
-        for (let i = 0; i < renderLimit; i++) {
-          if (i > 0) await new Promise(resolve => setTimeout(resolve, 5000));
-          
-          try {
-            const imgUrl = await geminiService.generateThumbnail(
-              `${plan.frames[i].prompt}. Concept: ${plan.visualStyle}. Single frame of animation, high consistency.`
-            );
-            setRenderedFrames(prev => [...prev, imgUrl]);
-          } catch (frameErr: any) {
-            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
-               alert("LIMITE DE COTA: Foram gerados " + i + " frames de animação. Aguarde 2 minutos para o restante.");
-               break;
-            }
-            throw frameErr;
-          }
-        }
-      } else {
-        // Modo Edit de Vídeo (Estilização de Frames Existentes)
-        const plan = await geminiService.synthesizeVideoEdit({
-          images: sourceImages,
-          extraImages: animImages.length > 0 ? animImages : undefined,
-          instructions
-        });
-        setAiResult(plan);
-
-        const renderLimit = Math.min(plan.frames.length, 10);
-        for (let i = 0; i < renderLimit; i++) {
-          const framePlan = plan.frames[i];
-          if (i > 0) await new Promise(resolve => setTimeout(resolve, 5000));
-
-          try {
-            const imgUrl = await geminiService.generateThumbnail(
-              `${framePlan.generationPrompt}. Maintain consistency with style: ${plan.colorGrade || ''}`
-            );
-            setRenderedFrames(prev => [...prev, imgUrl]);
-          } catch (frameErr: any) {
-            if (frameErr.message?.includes('429') || frameErr.message?.includes('LIMITE_COTA')) {
-               alert("LIMITE DE COTA: A edição de vídeo foi pausada. Aguarde 2 minutos para continuar.");
-               break;
-            }
-            throw frameErr;
-          }
-        }
-      }
-    } catch (err: any) {
-      console.error(err);
-      let errorMsg = err.message;
-      if (err.message?.includes('429') || err.message?.includes('LIMITE_COTA')) {
-        errorMsg = "Cota de IA esgotada. Por favor, aguarde 2 minutos antes da próxima renderização.";
-      }
-      alert("Erro na Renderização Pro: " + errorMsg);
-    } finally {
-      setIsRendering(false);
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      setVideoFile(file);
+      setVideoUrl(URL.createObjectURL(file));
+      setFrames([]);
+      setAiResult(null);
+      setRenderedFrames([]);
     }
   };
 
-  const processLab = async () => {
-    setProcessing(true);
-    
-    try {
-      let resultText = '';
-      if (labMode === 'video') {
-         if (frames.length === 0) throw new Error("Extraia frames primeiro");
-         resultText = await geminiService.processVideoFrames(
-          frames.map(f => f.data),
-          instructions
-        );
-      } else {
-         if (animImages.length === 0) throw new Error("Selecione imagens primeiro");
-         resultText = await geminiService.animateImages(
-          animImages,
-          instructions
-        );
-      }
-      
-      if (!resultText) throw new Error("Sem resposta da IA");
-      
-      try {
-        const jsonMatch = resultText.match(/\{[\s\S]*\}/);
-        const parsed = JSON.parse(jsonMatch ? jsonMatch[0] : resultText);
-        setAiResult(parsed);
-      } catch (e) {
-        setAiResult({ summary: resultText });
-      }
-      
-    } catch (err: any) {
-      console.error(err);
-      alert(err.message || "Erro no processamento da IA");
-    } finally {
-      setProcessing(false);
-    }
-  };
+  const totalDurationSeconds = renderedFrames.length > 0 ? (renderedFrames.length / fps).toFixed(2) : '0.00';
+  const currentTimecode = renderedFrames.length > 0 ? (currentFrameIdx / fps).toFixed(2) : '0.00';
 
   return (
     <motion.div 
-      initial={{ opacity: 0, y: 20 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: 20 }}
-      className="fixed inset-0 z-[100] flex items-center justify-center p-4 md:p-10 bg-black/80 backdrop-blur-xl"
+      initial={{ opacity: 0, scale: 0.98 }}
+      animate={{ opacity: 1, scale: 1 }}
+      exit={{ opacity: 0, scale: 0.98 }}
+      className="fixed inset-0 z-[100] flex items-center justify-center p-3 sm:p-6 md:p-8 bg-black/85 backdrop-blur-2xl"
     >
-      <div className="bg-[#1a1a1a] w-full max-w-6xl h-full max-h-[85vh] rounded-[2.5rem] border border-white/10 overflow-hidden flex flex-col shadow-2xl relative">
+      <div className="bg-[#121214] w-full max-w-7xl h-full max-h-[92vh] rounded-[2.5rem] border border-white/10 overflow-hidden flex flex-col shadow-[0_0_80px_rgba(0,0,0,0.8)] relative">
         
-        {/* Close Button */}
-        <button 
-          onClick={onClose}
-          className="absolute top-6 right-6 p-3 bg-white/5 hover:bg-red-500/20 text-gray-400 hover:text-red-500 rounded-2xl transition-all z-10"
-        >
-          <X size={24} />
-        </button>
-
-        {/* Header */}
-        <div className="p-8 border-b border-white/5 flex items-center justify-between">
-          <div className="flex items-center gap-4">
-            <div className="p-3 bg-emerald-500/10 rounded-2xl">
-              <Film className="text-emerald-500" size={24} />
+        {/* Top Header */}
+        <div className="px-6 py-4 sm:px-8 sm:py-5 border-b border-white/10 flex items-center justify-between bg-black/40">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="p-2.5 sm:p-3 bg-gradient-to-tr from-emerald-500/20 to-cyan-500/20 border border-emerald-500/30 rounded-2xl">
+              <Film className="text-emerald-400" size={22} />
             </div>
             <div>
-              <h2 className="text-xl font-black text-white italic tracking-tighter uppercase">AI Studio Pro</h2>
-              <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">Motor de Edição e Animação v5.0</p>
+              <div className="flex items-center gap-2">
+                <h2 className="text-lg sm:text-xl font-black text-white italic tracking-tight uppercase">AI Video Studio Pro</h2>
+                <span className="px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 text-[10px] font-black tracking-widest uppercase border border-emerald-500/30">
+                  FPS Engine v6.0
+                </span>
+              </div>
+              <p className="text-[10px] sm:text-xs text-gray-400 font-medium tracking-wide">
+                Gere vídeos quadro a quadro por IA com controle de FPS e Sound Design
+              </p>
             </div>
           </div>
 
-          <div className="flex bg-white/5 p-1 rounded-2xl border border-white/5">
+          {/* Mode Switcher */}
+          <div className="flex items-center gap-3">
+            <div className="flex bg-white/5 p-1 rounded-2xl border border-white/10">
+              <button 
+                onClick={() => { setLabMode('movie'); setAiResult(null); }}
+                className={`px-3 sm:px-5 py-2 rounded-xl text-[11px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${labMode === 'movie' ? 'bg-gradient-to-r from-emerald-500 to-teal-500 text-black shadow-lg shadow-emerald-500/25' : 'text-gray-400 hover:text-white'}`}
+              >
+                <Sparkles size={13} />
+                <span>AI Video Gen</span>
+              </button>
+              <button 
+                onClick={() => { setLabMode('animation'); setAiResult(null); }}
+                className={`px-3 sm:px-5 py-2 rounded-xl text-[11px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${labMode === 'animation' ? 'bg-gradient-to-r from-emerald-500 to-teal-500 text-black shadow-lg shadow-emerald-500/25' : 'text-gray-400 hover:text-white'}`}
+              >
+                <Layers size={13} />
+                <span>Animate Image</span>
+              </button>
+              <button 
+                onClick={() => { setLabMode('video'); setAiResult(null); }}
+                className={`px-3 sm:px-5 py-2 rounded-xl text-[11px] font-black uppercase tracking-wider transition-all flex items-center gap-1.5 ${labMode === 'video' ? 'bg-gradient-to-r from-emerald-500 to-teal-500 text-black shadow-lg shadow-emerald-500/25' : 'text-gray-400 hover:text-white'}`}
+              >
+                <Scissors size={13} />
+                <span>Video Remix</span>
+              </button>
+            </div>
+
             <button 
-              onClick={() => {setLabMode('video'); setAiResult(null);}}
-              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${labMode === 'video' ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/20' : 'text-gray-500 hover:text-white'}`}
+              onClick={onClose}
+              className="p-2.5 bg-white/5 hover:bg-red-500/20 text-gray-400 hover:text-red-400 rounded-2xl border border-white/5 hover:border-red-500/30 transition-all"
+              title="Fechar"
             >
-              Analyze Video
-            </button>
-            <button 
-              onClick={() => {setLabMode('animation'); setAiResult(null);}}
-              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${labMode === 'animation' ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/20' : 'text-gray-500 hover:text-white'}`}
-            >
-              Animate Image
-            </button>
-            <button 
-              onClick={() => {setLabMode('movie'); setAiResult(null);}}
-              className={`px-4 py-2 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all ${labMode === 'movie' ? 'bg-emerald-500 text-black shadow-lg shadow-emerald-500/20' : 'text-gray-500 hover:text-white'}`}
-            >
-              AI Movie Gen
+              <X size={20} />
             </button>
           </div>
         </div>
 
-        <div className="flex-1 overflow-y-auto custom-scrollbar p-8">
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-10 h-full">
+        {/* Studio Content Body */}
+        <div className="flex-1 overflow-y-auto custom-scrollbar p-6 sm:p-8">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-8 h-full">
             
-            {/* Left Col: Upload & Preview */}
-            <div className="space-y-6">
-              {renderedFrames.length > 0 ? (
-                <div className="space-y-4">
-                  <div className="relative rounded-[2rem] overflow-hidden border-4 border-emerald-500/20 bg-black aspect-video flex items-center justify-center shadow-2xl shadow-emerald-500/10">
+            {/* Left Col: Screen Canvas & Timeline Player (7 cols) */}
+            <div className="lg:col-span-7 flex flex-col space-y-5">
+              
+              {/* Main Screen / Player */}
+              <div className="relative rounded-[2rem] overflow-hidden border-2 border-white/10 bg-black aspect-video flex items-center justify-center shadow-2xl group">
+                
+                {/* Hidden canvas used for rendering, interpolation and export stream */}
+                <canvas 
+                  ref={canvasRef} 
+                  width={1280} 
+                  height={720} 
+                  className="w-full h-full object-contain"
+                />
+
+                {/* Rendered Frame visualizer overlay with smooth transitions */}
+                {renderedFrames.length > 0 ? (
+                  <div className="absolute inset-0 pointer-events-none">
                     <AnimatePresence mode="wait">
                       <motion.img 
                         key={currentFrameIdx}
                         src={renderedFrames[currentFrameIdx]}
-                        initial={{ opacity: 0, scale: 1.1, filter: 'blur(10px)' }}
-                        animate={{ opacity: 1, scale: 1, filter: 'blur(0px)' }}
-                        exit={{ opacity: 0, scale: 0.9, filter: 'brightness(2)' }}
-                        transition={{ duration: 0.3 }}
+                        initial={{ opacity: smoothTransitions ? 0.7 : 1, scale: 1.01 }}
+                        animate={{ opacity: 1, scale: 1 }}
+                        exit={{ opacity: smoothTransitions ? 0.7 : 1 }}
+                        transition={{ duration: smoothTransitions ? 0.12 : 0 }}
                         className="w-full h-full object-cover"
                       />
                     </AnimatePresence>
-                    <div className="absolute top-4 left-4 px-3 py-1 bg-emerald-500 text-black text-[8px] font-black uppercase rounded-lg">
-                      AI RENDER ACTIVE
-                    </div>
-                    <div className="absolute bottom-4 right-4 flex gap-1">
-                       {renderedFrames.map((_, i) => (
-                         <div key={i} className={`w-1.5 h-1.5 rounded-full transition-all ${i === currentFrameIdx ? 'w-4 bg-emerald-500' : 'bg-white/20'}`} />
-                       ))}
-                    </div>
-                  </div>
-                  <div className="p-4 bg-white/5 rounded-2xl border border-white/10 flex items-center justify-between">
-                    <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest">Preview da Edit Renderizada</p>
-                    <button 
-                      onClick={() => setRenderedFrames([])}
-                      className="text-[10px] font-black text-red-500 uppercase hover:underline"
-                    >
-                      Voltar ao Editor
-                    </button>
-                  </div>
-                </div>
-              ) : labMode === 'video' ? (
-                <>
-                  {!videoUrl ? (
-                    <div className="h-[400px] border-2 border-dashed border-white/5 rounded-[2rem] flex flex-col items-center justify-center gap-4 group hover:border-emerald-500/40 transition-all cursor-pointer relative overflow-hidden">
-                      <input 
-                        type="file" 
-                        accept="video/*" 
-                        onChange={handleFileChange}
-                        className="absolute inset-0 opacity-0 cursor-pointer"
-                      />
-                      <div className="p-6 bg-white/5 rounded-3xl group-hover:bg-emerald-500/10 transition-colors">
-                        <Video size={40} className="text-gray-600 group-hover:text-emerald-500 transition-colors" />
-                      </div>
-                      <div className="text-center">
-                        <p className="text-sm font-black text-white uppercase tracking-widest">Carregar Vídeo</p>
-                        <p className="text-[10px] text-gray-500 font-bold uppercase mt-1">Extraia prompts e edições</p>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="space-y-4">
-                      <div className="relative rounded-[2rem] overflow-hidden border border-white/10 bg-black aspect-video flex items-center justify-center">
-                        <video 
-                          ref={videoRef} 
-                          src={videoUrl} 
-                          className="w-full h-full object-contain" 
-                          controls
-                        />
-                        <canvas ref={canvasRef} className="hidden" width={1280} height={720} />
-                      </div>
-                      <div className="flex gap-4">
-                        <button 
-                          onClick={() => {setVideoUrl(null); setVideoFile(null); setFrames([]);}}
-                          className="flex-1 py-4 bg-white/5 hover:bg-red-500/20 text-gray-400 hover:text-red-500 font-black text-xs uppercase tracking-widest rounded-2xl transition-all"
-                        >
-                          Limpar
-                        </button>
-                        <button 
-                          onClick={extractFrames}
-                          disabled={isExtracting}
-                          className="flex-1 py-4 bg-emerald-500 hover:bg-emerald-400 text-black font-black text-xs uppercase tracking-widest rounded-2xl transition-all disabled:opacity-50"
-                        >
-                          {isExtracting ? 'Capturando ' : 'Capturar Frames'}
-                        </button>
-                      </div>
-                    </div>
-                  )}
 
-                  {frames.length > 0 && (
-                    <div className="space-y-3">
-                      <p className="text-[10px] font-black uppercase text-gray-500 tracking-widest px-2">Keyframes Capturados ({frames.length})</p>
-                      <div className="flex gap-3 overflow-x-auto pb-4 custom-scrollbar">
-                        {frames.map((f, i) => (
-                          <div key={i} className="min-w-[120px] aspect-video rounded-xl overflow-hidden border border-white/10 group relative">
-                            <img src={f.data} className="w-full h-full object-cover" />
-                          </div>
-                        ))}
-                      </div>
+                    {/* HUD Status Badges */}
+                    <div className="absolute top-4 left-4 flex items-center gap-2">
+                      <span className="px-3 py-1 bg-emerald-500/90 backdrop-blur-md text-black font-black text-[10px] uppercase tracking-widest rounded-lg flex items-center gap-1.5 shadow-lg">
+                        <span className="w-2 h-2 rounded-full bg-black animate-pulse" />
+                        {isPlaying ? "PLAYING" : "PAUSED"} @ {fps} FPS
+                      </span>
+                      <span className="px-2.5 py-1 bg-black/70 backdrop-blur-md border border-white/20 text-white font-mono text-[10px] rounded-lg">
+                        {currentTimecode}s / {totalDurationSeconds}s
+                      </span>
                     </div>
-                  )}
-                </>
-              ) : (
-                <div className="space-y-6">
-                  <div 
-                    className={`h-[400px] border-2 border-dashed border-white/5 rounded-[2rem] flex flex-col items-center justify-center gap-4 group hover:border-emerald-500/40 transition-all cursor-pointer relative overflow-hidden ${animImages.length > 0 ? 'bg-black/20' : ''}`}
-                  >
-                    <input 
-                      type="file" 
-                      accept="image/*" 
-                      multiple
-                      onChange={handleImageBatchChange}
-                      className="absolute inset-0 opacity-0 cursor-pointer"
-                    />
-                    {animImages.length === 0 ? (
-                      <>
-                        <div className="p-6 bg-white/5 rounded-3xl group-hover:bg-emerald-500/10 transition-colors">
-                          <Eye size={40} className="text-gray-600 group-hover:text-emerald-500 transition-colors" />
+
+                    <div className="absolute top-4 right-4 flex items-center gap-2">
+                      <span className="px-2.5 py-1 bg-black/70 backdrop-blur-md border border-white/20 text-emerald-400 font-black text-[10px] rounded-lg uppercase tracking-wider">
+                        FRAME #{currentFrameIdx + 1}/{renderedFrames.length}
+                      </span>
+                    </div>
+
+                    {/* Current Frame Action / SFX Banner */}
+                    {aiResult?.frames?.[currentFrameIdx] && (
+                      <div className="absolute bottom-4 left-4 right-4 p-3 bg-black/70 backdrop-blur-md border border-white/10 rounded-2xl flex items-center justify-between text-xs text-white">
+                        <div className="flex items-center gap-2 truncate">
+                          <span className="px-2 py-0.5 bg-cyan-500/20 text-cyan-400 text-[9px] font-black rounded-md uppercase">
+                            Ação
+                          </span>
+                          <span className="truncate font-medium text-[11px]">
+                            {aiResult.frames[currentFrameIdx].action}
+                          </span>
                         </div>
-                        <div className="text-center">
-                          <p className="text-sm font-black text-white uppercase tracking-widest">Carregar Imagens (Até 6)</p>
-                          <p className="text-[10px] text-gray-500 font-bold uppercase mt-1">A IA criará animação por keyframes</p>
-                        </div>
-                      </>
-                    ) : (
-                      <div className="grid grid-cols-3 gap-2 p-4 w-full h-full">
-                         {animImages.map((img, i) => (
-                            <img key={i} src={img} className="w-full h-full object-cover rounded-xl border border-white/10 shadow-lg" />
-                         ))}
-                         {animImages.length < 6 && (
-                            <div className="w-full h-full bg-white/5 border border-dashed border-white/20 rounded-xl flex items-center justify-center">
-                               <p className="text-[10px] font-black text-gray-600 uppercase">+{6 - animImages.length}</p>
-                            </div>
-                         )}
+                        {aiResult.frames[currentFrameIdx].sfx && (
+                          <div className="flex items-center gap-1 text-[10px] text-yellow-400 font-bold uppercase tracking-wider shrink-0 bg-yellow-400/10 px-2 py-0.5 rounded-md">
+                            <Music size={11} />
+                            SFX: {aiResult.frames[currentFrameIdx].sfx}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
-                  {animImages.length > 0 && (
+                ) : labMode === 'video' && videoUrl ? (
+                  <video 
+                    ref={videoRef} 
+                    src={videoUrl} 
+                    className="w-full h-full object-contain" 
+                    controls
+                  />
+                ) : (
+                  <div className="flex flex-col items-center justify-center gap-4 text-center p-8">
+                    <div className="w-16 h-16 rounded-3xl bg-white/5 border border-white/10 flex items-center justify-center text-gray-500">
+                      <Film size={32} />
+                    </div>
+                    <div>
+                      <p className="text-sm font-bold text-white uppercase tracking-wider">Player de Vídeo AI Pronto</p>
+                      <p className="text-xs text-gray-500 mt-1 max-w-sm">
+                        Defina as opções de FPS, estilo e prompt ao lado e clique em Gerar Vídeo para sintetizar a sequência de frames.
+                      </p>
+                    </div>
+                  </div>
+                )}
+
+                {/* Loading / Render Progress Overlay */}
+                {isRendering && (
+                  <div className="absolute inset-0 bg-black/80 backdrop-blur-md flex flex-col items-center justify-center gap-4 p-6 z-20">
+                    <div className="relative">
+                      <Loader2 className="w-12 h-12 text-emerald-400 animate-spin" />
+                      <span className="absolute inset-0 flex items-center justify-center text-[10px] font-black text-white">
+                        {renderProgress.current}/{renderProgress.total}
+                      </span>
+                    </div>
+                    <div className="text-center space-y-1">
+                      <p className="text-sm font-black text-white uppercase tracking-widest">
+                        {renderProgress.status}
+                      </p>
+                      <p className="text-xs text-emerald-400 font-mono">
+                        Taxa de Render: {fps} FPS • Processamento Temporal Contínuo
+                      </p>
+                    </div>
+                    <div className="w-64 h-1.5 bg-white/10 rounded-full overflow-hidden">
+                      <motion.div 
+                        className="h-full bg-gradient-to-r from-emerald-500 to-cyan-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${(renderProgress.current / Math.max(renderProgress.total, 1)) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Player Controls & Scrubber */}
+              <div className="p-4 bg-white/[0.03] border border-white/10 rounded-3xl space-y-4">
+                
+                {/* Timeline Scrubber Slider */}
+                <div className="space-y-1.5">
+                  <div className="flex justify-between items-center text-[10px] font-mono text-gray-400 uppercase tracking-widest px-1">
+                    <span>TIMELINE: {currentTimecode}s</span>
+                    <span className="text-emerald-400 font-black">
+                      FRAME {renderedFrames.length > 0 ? currentFrameIdx + 1 : 0} DE {renderedFrames.length}
+                    </span>
+                    <span>TOTAL: {totalDurationSeconds}s</span>
+                  </div>
+                  <input 
+                    type="range"
+                    min={0}
+                    max={Math.max(renderedFrames.length - 1, 0)}
+                    value={currentFrameIdx}
+                    disabled={renderedFrames.length === 0 || isRendering}
+                    onChange={(e) => {
+                      setIsPlaying(false);
+                      setCurrentFrameIdx(Number(e.target.value));
+                    }}
+                    className="w-full h-2 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                  />
+                </div>
+
+                {/* Control Bar Buttons */}
+                <div className="flex flex-wrap items-center justify-between gap-3 pt-1">
+                  
+                  {/* Playback Button Group */}
+                  <div className="flex items-center gap-2">
                     <button 
-                      onClick={() => setAnimImages([])}
-                      className="w-full py-4 bg-white/5 hover:bg-red-500/20 text-gray-400 hover:text-red-500 font-black text-xs uppercase tracking-widest rounded-2xl transition-all"
+                      onClick={stepPrev}
+                      disabled={renderedFrames.length === 0}
+                      className="p-2.5 bg-white/5 hover:bg-white/10 text-white rounded-xl disabled:opacity-30 transition-all"
+                      title="Frame Anterior"
                     >
-                      Remover Imagens
+                      <SkipBack size={16} />
                     </button>
-                  )}
+
+                    <button 
+                      onClick={togglePlay}
+                      disabled={renderedFrames.length === 0}
+                      className="px-5 py-2.5 bg-gradient-to-r from-emerald-500 to-teal-400 hover:from-emerald-400 hover:to-teal-300 text-black font-black text-xs uppercase tracking-widest rounded-xl disabled:opacity-30 transition-all flex items-center gap-2 shadow-lg shadow-emerald-500/20"
+                    >
+                      {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+                      <span>{isPlaying ? 'Pausar' : 'Reproduzir'}</span>
+                    </button>
+
+                    <button 
+                      onClick={stepNext}
+                      disabled={renderedFrames.length === 0}
+                      className="p-2.5 bg-white/5 hover:bg-white/10 text-white rounded-xl disabled:opacity-30 transition-all"
+                      title="Próximo Frame"
+                    >
+                      <SkipForward size={16} />
+                    </button>
+
+                    <button 
+                      onClick={() => setIsPingPong(p => !p)}
+                      disabled={renderedFrames.length === 0}
+                      className={`p-2.5 rounded-xl border transition-all ${isPingPong ? 'bg-cyan-500/20 border-cyan-500 text-cyan-400' : 'bg-white/5 border-transparent text-gray-400 hover:text-white'}`}
+                      title="Modo Ping-Pong (Vai e Volta)"
+                    >
+                      <Repeat size={16} />
+                    </button>
+
+                    <button 
+                      onClick={() => setSmoothTransitions(s => !s)}
+                      className={`p-2.5 rounded-xl border transition-all text-xs font-black uppercase ${smoothTransitions ? 'bg-emerald-500/20 border-emerald-500 text-emerald-400' : 'bg-white/5 border-transparent text-gray-400 hover:text-white'}`}
+                      title="Suavização Óptica entre Frames"
+                    >
+                      <span>SMOOTH</span>
+                    </button>
+                  </div>
+
+                  {/* Audio Controls */}
+                  <div className="flex items-center gap-2 bg-black/40 px-3 py-1.5 rounded-2xl border border-white/5">
+                    <button 
+                      onClick={() => setIsAudioEnabled(a => !a)}
+                      className={`p-1.5 rounded-lg ${isAudioEnabled ? 'text-emerald-400' : 'text-gray-600'}`}
+                      title={isAudioEnabled ? "Som Ativo" : "Som Mudo"}
+                    >
+                      {isAudioEnabled ? <Volume2 size={16} /> : <VolumeX size={16} />}
+                    </button>
+                    <input 
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.05}
+                      value={isAudioEnabled ? audioVolume : 0}
+                      onChange={(e) => {
+                        setAudioVolume(Number(e.target.value));
+                        setIsAudioEnabled(true);
+                      }}
+                      className="w-16 h-1.5 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                    />
+                  </div>
+
+                  {/* Export Button */}
+                  <button 
+                    onClick={exportToVideo}
+                    disabled={renderedFrames.length === 0 || isCapturing}
+                    className="px-4 py-2.5 bg-white hover:bg-gray-200 text-black font-black text-xs uppercase tracking-widest rounded-xl transition-all disabled:opacity-30 flex items-center gap-2"
+                  >
+                    {isCapturing ? (
+                      <>
+                        <Loader2 className="animate-spin" size={14} />
+                        <span>Exportando ({exportProgress}%)...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download size={14} />
+                        <span>Exportar .MP4</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Filmstrip Frame List */}
+              {renderedFrames.length > 0 && (
+                <div className="p-4 bg-white/[0.02] border border-white/10 rounded-3xl space-y-3">
+                  <div className="flex items-center justify-between text-[11px] font-black uppercase tracking-widest text-gray-400 px-1">
+                    <span>Sequência de Frames ({renderedFrames.length} Frames a {fps} FPS)</span>
+                    <button 
+                      onClick={() => {
+                        setRenderedFrames([]);
+                        setAiResult(null);
+                        setIsPlaying(false);
+                      }}
+                      className="text-red-400 hover:underline text-[10px]"
+                    >
+                      Limpar Render
+                    </button>
+                  </div>
+                  <div className="flex gap-2.5 overflow-x-auto pb-2 custom-scrollbar">
+                    {renderedFrames.map((f, i) => (
+                      <div 
+                        key={i}
+                        onClick={() => {
+                          setIsPlaying(false);
+                          setCurrentFrameIdx(i);
+                        }}
+                        className={`min-w-[100px] aspect-video rounded-xl overflow-hidden border-2 cursor-pointer transition-all relative shrink-0 ${i === currentFrameIdx ? 'border-emerald-400 scale-105 shadow-lg shadow-emerald-500/20' : 'border-white/10 opacity-70 hover:opacity-100'}`}
+                      >
+                        <img src={f} className="w-full h-full object-cover" alt={`Frame ${i + 1}`} />
+                        <div className="absolute top-1 left-1 px-1.5 py-0.5 bg-black/80 rounded text-[8px] font-mono text-white font-bold">
+                          #{i + 1}
+                        </div>
+                        <div className="absolute bottom-1 right-1 px-1 py-0.5 bg-emerald-500/90 rounded text-[7px] font-mono text-black font-black">
+                          {((i + 1) / fps).toFixed(2)}s
+                        </div>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
+
             </div>
 
-            {/* Right Col: AI Controls & Results */}
-            <div className="flex flex-col h-full bg-white/[0.02] border border-white/5 rounded-[2rem] p-8 space-y-6">
-              <div className="space-y-4">
-                <label className="text-[10px] font-black uppercase text-emerald-500 tracking-widest block">
-                  {labMode === 'video' ? 'Instruções para Edição / Prompt' : labMode === 'movie' ? 'Script para o Filme (10 frames / 0.1s)' : 'Instruções para Animação'}
-                </label>
-                <textarea 
-                  value={instructions}
-                  onChange={(e) => setInstructions(e.target.value)}
-                  placeholder={
-                    labMode === 'video' ? "Ex: Dê um preview de como seria um edit estilo Phonk com este vídeo..." :
-                    labMode === 'movie' ? "Ex: Um astronauta caminhando em Marte em câmera lenta..." :
-                    "Ex: Mova os braços e faça os olhos brilharem..."
-                  }
-                  className="w-full h-32 bg-white/5 border border-white/10 rounded-2xl p-4 text-sm focus:outline-none focus:border-emerald-500/40 custom-scrollbar resize-none font-medium"
-                />
-                <button 
-                  onClick={renderVideoEdit}
-                  disabled={isRendering || processing || (labMode === 'video' ? frames.length === 0 : labMode === 'movie' ? false : animImages.length === 0)}
-                  className="w-full py-5 bg-gradient-to-r from-emerald-600 to-blue-500 hover:from-emerald-500 hover:to-blue-400 text-white font-black text-xs uppercase tracking-widest rounded-2xl transition-all shadow-xl shadow-blue-500/20 disabled:opacity-30"
-                >
-                  {isRendering ? (
-                    <div className="flex items-center justify-center gap-2">
-                       <Loader2 className="animate-spin" size={18} />
-                       RENDERIZANDO FRAME {renderedFrames.length + 1}/{aiResult?.frames?.length || aiResult?.keyframes?.length || 10}...
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-center gap-2">
-                       <Video size={18} />
-                       GERAR EDIT COMPLETA (RENDER)
-                    </div>
-                  )}
-                </button>
-
-                <button 
-                  onClick={processLab}
-                  disabled={processing || isRendering || (labMode === 'video' ? frames.length === 0 : animImages.length === 0)}
-                  className="w-full py-5 bg-white/5 hover:bg-white/10 text-white font-black text-xs uppercase tracking-widest rounded-2xl transition-all border border-white/10"
-                >
-                  {processing ? (
-                    <div className="flex items-center justify-center gap-2">
-                       <Loader2 className="animate-spin" size={18} />
-                       ENGINE PROCESSANDO...
-                    </div>
-                  ) : (
-                    <div className="flex items-center justify-center gap-2">
-                       <Sparkles size={18} />
-                       {labMode === 'video' ? 'GERAR PROMPT E EDIT' : 'GERAR ANIMAÇÃO POR KEYFRAMES'}
-                    </div>
-                  )}
-                </button>
-              </div>
-
-                              <AnimatePresence mode="wait">
-                  {aiResult ? (
-                    <motion.div 
-                      key="result"
-                      initial={{ opacity: 0, scale: 0.95 }}
-                      animate={{ opacity: 1, scale: 1 }}
-                      className="space-y-6"
-                    >
-                      {/* Movie specific result */}
-                      {labMode === 'movie' && aiResult?.movieData && (
-                        <div className="space-y-6">
-                           <div className="p-4 bg-blue-500/20 border border-blue-500/40 rounded-2xl">
-                             <div className="flex items-center gap-2 mb-1">
-                               <Film size={14} className="text-blue-500" />
-                               <h3 className="text-[10px] font-black text-blue-500 tracking-widest uppercase">AI MOVIE: {aiResult.styleTitle}</h3>
-                             </div>
-                             <p className="text-[10px] text-blue-500/60 font-bold uppercase mt-1">Cinematography: {aiResult.colorGrade}</p>
-                           </div>
-
-                           <div className="p-5 bg-white/5 border border-white/10 rounded-3xl">
-                            <h3 className="text-[10px] font-black text-gray-500 tracking-widest uppercase mb-3 text-center">Protocolo de Som & Luz</h3>
-                            <div className="grid grid-cols-2 gap-4">
-                              <div className="p-3 bg-white/5 rounded-xl border border-white/5">
-                                <p className="text-[8px] font-black text-blue-500 uppercase">Soundtrack</p>
-                                <p className="text-xs text-white font-bold">{aiResult.moodAnalysis}</p>
-                              </div>
-                              <div className="p-3 bg-white/5 rounded-xl border border-white/5">
-                                <p className="text-[8px] font-black text-blue-500 uppercase">Lighting</p>
-                                <p className="text-xs text-white font-bold">{aiResult.audioContext}</p>
-                              </div>
-                            </div>
-                           </div>
-
-                           {renderedFrames.length > 0 && !isRendering && (
-                            <button
-                              onClick={exportToVideo}
-                              disabled={isCapturing}
-                              className="w-full py-4 bg-emerald-500 text-black font-black uppercase tracking-widest rounded-2xl hover:bg-emerald-400 transition-all flex items-center justify-center gap-2"
-                            >
-                              <Download size={18} />
-                              {isCapturing ? "Convertendo para MP4..." : "Exportar Filme .MP4"}
-                            </button>
-                           )}
-
-                           <div className="space-y-3">
-                              <h3 className="text-[10px] font-black text-blue-500 tracking-widest uppercase px-1">Roteiro de Frame (SFX Mix)</h3>
-                              <div className="space-y-2 overflow-y-auto max-h-[300px] custom-scrollbar pr-2">
-                                 {aiResult.movieData.frames.map((kf: any, i: number) => (
-                                    <div key={i} className="p-3 bg-white/[0.03] rounded-2xl border border-white/5 flex gap-4 items-start">
-                                       <div className="w-10 h-10 rounded-lg bg-blue-500/10 flex items-center justify-center text-blue-500 font-black text-[10px] shrink-0">
-                                          #{kf.id}
-                                       </div>
-                                       <div className="space-y-1 flex-1">
-                                          <p className="text-xs font-bold text-white uppercase tracking-widest">{kf.action}</p>
-                                          <div className="flex items-center gap-2">
-                                            <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">SFX: {kf.sfx}</p>
-                                          </div>
-                                        </div>
-                                    </div>
-                                 ))}
-                              </div>
-                           </div>
-                        </div>
-                      )}
-
-                      {/* Video specific result */}
-                      {labMode === 'video' && aiResult?.styleTitle && (
-                        <div className="space-y-4">
-                          <div className="p-4 bg-emerald-500/20 border border-emerald-500/40 rounded-2xl">
-                             <div className="flex items-center gap-2 mb-1">
-                               <Sparkles size={14} className="text-emerald-500" />
-                               <h3 className="text-[10px] font-black text-emerald-500 tracking-widest uppercase">Master Style: {aiResult.styleTitle}</h3>
-                             </div>
-                             <p className="text-[10px] text-emerald-500/60 font-bold uppercase mt-1">Grade: {aiResult.colorGrade}</p>
-                             <p className="text-[10px] text-emerald-500/60 font-bold uppercase">Sync: {aiResult.bpmSugerido} BPM</p>
-                          </div>
-
-                          <div className="p-5 bg-white/5 border border-white/10 rounded-3xl">
-                            <h3 className="text-[10px] font-black text-gray-500 tracking-widest uppercase mb-2">Protocolo de Produção</h3>
-                            <div className="flex gap-4">
-                              <div className="flex-1 p-3 bg-white/5 rounded-xl border border-white/5">
-                                <p className="text-[8px] font-black text-emerald-500 uppercase">Vibe</p>
-                                <p className="text-xs text-white font-bold">{aiResult.moodAnalysis}</p>
-                              </div>
-                              <div className="flex-1 p-3 bg-white/5 rounded-xl border border-white/5">
-                                <p className="text-[8px] font-black text-emerald-500 uppercase">Audio Sync</p>
-                                <p className="text-xs text-white font-bold">{aiResult.audioContext}</p>
-                              </div>
-                            </div>
-                          </div>
-
-                          {renderedFrames.length > 0 && !isRendering && (
-                            <button
-                              onClick={exportToVideo}
-                              disabled={isCapturing}
-                              className="w-full py-4 bg-emerald-500 text-black font-black uppercase tracking-widest rounded-2xl hover:bg-emerald-400 transition-all flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(16,185,129,0.3)] disabled:opacity-50"
-                            >
-                              <Download size={18} />
-                              {isCapturing ? "Gravando Vídeo..." : "Exportar como MP4"}
-                            </button>
-                          )}
-                        </div>
-                      )}
-
-                      {/* Animation specific result */}
-                      {labMode === 'animation' && (
-                        <div className="space-y-6">
-                          <div className="p-5 bg-white/5 rounded-3xl border border-white/10">
-                            <h3 className="text-[10px] font-black text-emerald-500 tracking-widest uppercase mb-2">Análise de Rigging</h3>
-                            <p className="text-sm text-gray-400 font-medium">{aiResult.characterAnalysis || aiResult.moodAnalysis}</p>
-                          </div>
-                          
-                          {renderedFrames.length > 0 && !isRendering && (
-                            <button
-                              onClick={exportToVideo}
-                              disabled={isCapturing}
-                              className="w-full py-4 bg-emerald-500 text-black font-black uppercase tracking-widest rounded-2xl hover:bg-emerald-400 transition-all flex items-center justify-center gap-2 shadow-[0_0_20px_rgba(16,185,129,0.3)] disabled:opacity-50"
-                            >
-                              <Download size={18} />
-                              {isCapturing ? "Gravando Vídeo..." : "Exportar como MP4"}
-                            </button>
-                          )}
-
-                          <div className="space-y-3">
-                             <h3 className="text-[10px] font-black text-emerald-500 tracking-widest uppercase px-1">Sequência de Keyframes de Movimento</h3>
-                             <div className="space-y-2">
-                                {aiResult.keyframes?.map((kf: any, i: number) => (
-                                   <div key={i} className="p-3 bg-white/[0.03] rounded-2xl border border-white/5 flex gap-4 items-start">
-                                      <div className="w-10 h-10 rounded-lg bg-emerald-500/10 flex items-center justify-center text-emerald-500 font-black text-[10px]">
-                                         #{kf.frame}
-                                      </div>
-                                      <div className="space-y-1 flex-1">
-                                         <p className="text-xs font-bold text-white uppercase tracking-widest">Ação: {kf.action}</p>
-                                         <p className="text-[10px] text-gray-500 font-bold uppercase tracking-widest">Camera: {kf.camera}</p>
-                                      </div>
-                                   </div>
-                                ))}
-                             </div>
-                          </div>
-                        </div>
-                      )}
-
-                      {!aiResult.keyframes && (
-                        <div className="p-5 bg-white/5 rounded-3xl border border-white/10">
-                          <h3 className="text-[10px] font-black text-emerald-500 tracking-widest uppercase mb-3">Relatório Técnico</h3>
-                          <p className="text-sm text-gray-300 leading-relaxed font-medium">
-                            {typeof (aiResult.summary || aiResult) === 'object' 
-                              ? JSON.stringify(aiResult.summary || aiResult) 
-                              : (aiResult.summary || aiResult)}
-                          </p>
-                        </div>
-                      )}
-                    </motion.div>
-                  ) : (
-                    <div className="h-full flex flex-col items-center justify-center text-center opacity-30 px-10">
-                       <Scissors size={40} className="mb-4" />
-                       <p className="text-xs font-bold uppercase tracking-widest">Aguardando Brainstorm de IA</p>
-                       <p className="text-[10px] font-medium mt-2">Combine visual e texto para produzir resultados profissionais.</p>
-                    </div>
-                  )}
-                </AnimatePresence>
-              </div>
-            </div>
-
-          </div>
-
-        {/* Footer Info */}
-        <div className="p-6 bg-black/40 border-t border-white/5 flex justify-between items-center px-10">
-          <div className="flex items-center gap-4">
-             <div className="flex -space-x-2">
-                {[1,2,3,4,5,6].map(i => (
-                  <div key={i} className="w-8 h-8 rounded-full border-2 border-[#1a1a1a] bg-[#222] flex items-center justify-center">
-                    <Sparkles size={12} className="text-emerald-500" />
+            {/* Right Col: AI Configuration & Engine Parameters (5 cols) */}
+            <div className="lg:col-span-5 flex flex-col space-y-5">
+              <div className="bg-white/[0.03] border border-white/10 rounded-[2rem] p-6 space-y-5 flex-1 overflow-y-auto custom-scrollbar">
+                
+                {/* Section Header */}
+                <div className="flex items-center justify-between pb-3 border-b border-white/5">
+                  <div className="flex items-center gap-2 text-emerald-400">
+                    <Sliders size={18} />
+                    <h3 className="text-xs font-black uppercase tracking-widest text-white">Parâmetros de Geração de Vídeo</h3>
                   </div>
-                ))}
-             </div>
-             <p className="text-[10px] font-bold text-gray-600 uppercase tracking-widest">Processador Multi-Modal Estendido v5.0</p>
+                  <span className="text-[10px] font-bold text-gray-500 uppercase">Motor Neural</span>
+                </div>
+
+                {/* FPS Control Slider and Presets */}
+                <div className="space-y-2.5 p-4 bg-black/40 rounded-2xl border border-white/5">
+                  <div className="flex justify-between items-center">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-emerald-400 flex items-center gap-1.5">
+                      <Gauge size={13} />
+                      Frames Por Segundo (FPS): <span className="text-white text-xs">{fps} FPS</span>
+                    </label>
+                    <span className="text-[10px] font-mono text-gray-400">
+                      {(1000 / fps).toFixed(1)}ms por frame
+                    </span>
+                  </div>
+
+                  <input 
+                    type="range"
+                    min={2}
+                    max={30}
+                    value={fps}
+                    onChange={(e) => setFps(Number(e.target.value))}
+                    className="w-full h-2 bg-white/10 rounded-lg appearance-none cursor-pointer accent-emerald-400"
+                  />
+
+                  {/* FPS Presets */}
+                  <div className="flex items-center gap-1.5 pt-1">
+                    {[4, 8, 10, 12, 15, 24, 30].map(val => (
+                      <button 
+                        key={val}
+                        onClick={() => setFps(val)}
+                        className={`flex-1 py-1 rounded-lg text-[10px] font-black transition-all ${fps === val ? 'bg-emerald-500 text-black shadow-md' : 'bg-white/5 text-gray-400 hover:text-white'}`}
+                      >
+                        {val}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Frame Count & Duration Estimator */}
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="p-3.5 bg-black/40 rounded-2xl border border-white/5 space-y-1.5">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-cyan-400 block">
+                      Qtd. de Frames
+                    </label>
+                    <select 
+                      value={frameCount}
+                      onChange={(e) => setFrameCount(Number(e.target.value))}
+                      className="w-full bg-white/5 border border-white/10 rounded-xl px-3 py-2 text-xs font-bold text-white focus:outline-none focus:border-cyan-400"
+                    >
+                      <option value={4} className="bg-[#1a1a1a]">4 Frames (Rápido)</option>
+                      <option value={6} className="bg-[#1a1a1a]">6 Frames</option>
+                      <option value={8} className="bg-[#1a1a1a]">8 Frames (Recomendado)</option>
+                      <option value={10} className="bg-[#1a1a1a]">10 Frames (Padrão)</option>
+                      <option value={12} className="bg-[#1a1a1a]">12 Frames (Fluido)</option>
+                      <option value={16} className="bg-[#1a1a1a]">16 Frames (Longo)</option>
+                    </select>
+                  </div>
+
+                  <div className="p-3.5 bg-black/40 rounded-2xl border border-white/5 space-y-1.5">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-emerald-400 block">
+                      Duração Total
+                    </label>
+                    <div className="flex items-center gap-1 text-white font-mono font-bold text-sm py-1.5 px-2 bg-white/5 rounded-xl">
+                      <Clock size={13} className="text-emerald-400" />
+                      <span>{(frameCount / fps).toFixed(2)} segundos</span>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Visual Style Preset */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-gray-400 block">
+                    Estilo Visual e Fotografia
+                  </label>
+                  <select 
+                    value={stylePreset}
+                    onChange={(e) => setStylePreset(e.target.value)}
+                    className="w-full bg-black/40 border border-white/10 rounded-2xl px-4 py-2.5 text-xs font-bold text-white focus:outline-none focus:border-emerald-500"
+                  >
+                    <option value="Cinematic 8K Ultra, Unreal Engine 5, Volumetric Lighting" className="bg-[#1a1a1a]">🎬 Cinema 8K & Unreal Engine 5</option>
+                    <option value="Cyberpunk Neon, Holographic, Rainy Tokyo Night, Futuristic" className="bg-[#1a1a1a]">🌆 Cyberpunk & Neon City</option>
+                    <option value="Studio Ghibli Anime Aesthetic, Vibrant Hand Drawn, Masterpiece" className="bg-[#1a1a1a]">🌸 Anime Studio Ghibli</option>
+                    <option value="3D Pixar Character Animation, Cute Vibrant Lighting, Octane Render" className="bg-[#1a1a1a]">🧸 3D Pixar Animation</option>
+                    <option value="Retro 80s VHS Synthwave, Glowing CRT Glitch, Laser Grid" className="bg-[#1a1a1a]">📼 Retro 80s VHS Synthwave</option>
+                    <option value="Dark Fantasy Epic, Elden Style, Mystic Fog, Cinematic Masterpiece" className="bg-[#1a1a1a]">🗡️ Dark Fantasy Épico</option>
+                    <option value="Hyper-Realistic Drone 4K Footage, Natural Lighting, Photorealistic" className="bg-[#1a1a1a]">🚁 Drone Hiper-Realista</option>
+                  </select>
+                </div>
+
+                {/* Sound Design Theme */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-yellow-400 flex items-center gap-1.5">
+                    <Music size={12} />
+                    <span>Trilha Sonora e Sound FX (Web Audio Synth)</span>
+                  </label>
+                  <select 
+                    value={soundTheme}
+                    onChange={(e) => setSoundTheme(e.target.value as SoundTheme)}
+                    className="w-full bg-black/40 border border-white/10 rounded-2xl px-4 py-2.5 text-xs font-bold text-white focus:outline-none focus:border-yellow-400"
+                  >
+                    <option value="cyberpunk" className="bg-[#1a1a1a]">⚡ Cyberpunk Synth & Bassline</option>
+                    <option value="cinematic" className="bg-[#1a1a1a]">🎻 Cinematic Orchestra & Chords</option>
+                    <option value="ambient" className="bg-[#1a1a1a]">🌌 Ambient Ethereal Pads</option>
+                    <option value="synthwave" className="bg-[#1a1a1a]">🕹️ Retro 80s Synthwave</option>
+                    <option value="action" className="bg-[#1a1a1a]">💥 Action & Heavy Impact</option>
+                    <option value="lofi" className="bg-[#1a1a1a]">☕ Lo-Fi Chill Beats</option>
+                    <option value="horror" className="bg-[#1a1a1a]">👻 Horror Dark Drone</option>
+                  </select>
+                </div>
+
+                {/* Optional Image Input for Start Frame */}
+                {labMode !== 'video' && (
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-gray-400 flex items-center justify-between">
+                      <span>Imagem Base / Referência (Opcional)</span>
+                      {animImages.length > 0 && (
+                        <button 
+                          onClick={() => setAnimImages([])} 
+                          className="text-red-400 hover:underline text-[9px]"
+                        >
+                          Remover
+                        </button>
+                      )}
+                    </label>
+                    <div className="border border-dashed border-white/10 hover:border-emerald-500/40 rounded-2xl p-3 bg-black/30 text-center relative cursor-pointer group transition-all">
+                      <input 
+                        type="file" 
+                        accept="image/*" 
+                        onChange={handleImageBatchChange} 
+                        className="absolute inset-0 opacity-0 cursor-pointer"
+                      />
+                      {animImages.length === 0 ? (
+                        <div className="py-2 flex items-center justify-center gap-2 text-xs text-gray-400">
+                          <Eye size={16} className="text-gray-500 group-hover:text-emerald-400" />
+                          <span>Clique para carregar imagem inicial de referência</span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center gap-3">
+                          <img src={animImages[0]} className="w-12 h-12 object-cover rounded-xl border border-white/10" />
+                          <div className="text-left text-xs">
+                            <p className="text-white font-bold">Imagem de Partida Carregada</p>
+                            <p className="text-[10px] text-emerald-400">A IA manterá consistência visual com esta base</p>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {/* Video Upload if in Video Remix mode */}
+                {labMode === 'video' && (
+                  <div className="space-y-2">
+                    <label className="text-[10px] font-black uppercase tracking-widest text-gray-400 block">
+                      Vídeo Original Para Fatiamento de Frames
+                    </label>
+                    <input 
+                      type="file" 
+                      accept="video/*" 
+                      onChange={handleFileChange}
+                      className="w-full text-xs text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-black file:bg-white/10 file:text-white hover:file:bg-white/20 cursor-pointer"
+                    />
+                    {videoUrl && frames.length === 0 && (
+                      <button 
+                        onClick={extractFrames}
+                        disabled={isExtracting}
+                        className="w-full py-2.5 bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-400 font-black text-[11px] uppercase tracking-wider rounded-xl transition-all border border-emerald-500/30"
+                      >
+                        {isExtracting ? 'Fatiando Vídeo a cada 0.1s...' : 'Fatiar Vídeo em Frames'}
+                      </button>
+                    )}
+                  </div>
+                )}
+
+                {/* Prompt Textarea */}
+                <div className="space-y-2">
+                  <label className="text-[10px] font-black uppercase tracking-widest text-emerald-400 block">
+                    {labMode === 'movie' ? 'Script / Roteiro do Vídeo' : 'Instruções de Movimento'}
+                  </label>
+                  <textarea 
+                    value={instructions}
+                    onChange={(e) => setInstructions(e.target.value)}
+                    placeholder="Descreva a sequência de vídeo que você quer gerar..."
+                    className="w-full h-24 bg-black/40 border border-white/10 rounded-2xl p-3.5 text-xs text-white placeholder-gray-500 focus:outline-none focus:border-emerald-500/50 resize-none font-medium custom-scrollbar"
+                  />
+                </div>
+
+                {/* Main Action Buttons */}
+                <div className="pt-2 space-y-2.5">
+                  <button 
+                    onClick={renderVideoGeneration}
+                    disabled={isRendering || (labMode === 'video' ? frames.length === 0 : false)}
+                    className="w-full py-4 bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-500 hover:from-emerald-400 hover:to-cyan-400 text-black font-black text-xs uppercase tracking-widest rounded-2xl transition-all shadow-xl shadow-emerald-500/20 disabled:opacity-30 flex items-center justify-center gap-2"
+                  >
+                    {isRendering ? (
+                      <>
+                        <Loader2 className="animate-spin" size={16} />
+                        <span>Renderizando Vídeo ({renderProgress.current}/{renderProgress.total})...</span>
+                      </>
+                    ) : (
+                      <>
+                        <Zap size={16} />
+                        <span>Gerar Vídeo em {fps} FPS ({frameCount} Frames)</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+
+              </div>
+            </div>
+
           </div>
-          <button 
-            disabled={!aiResult}
-            className="flex items-center gap-2 px-6 py-3 bg-white hover:bg-gray-200 text-black rounded-xl font-black text-xs uppercase tracking-widest transition-all disabled:opacity-20"
-          >
-            <Download size={16} />
-            Exportar Protocolo de Produção
-          </button>
+        </div>
+
+        {/* Footer Bar */}
+        <div className="px-8 py-3.5 bg-black/50 border-t border-white/5 flex flex-wrap items-center justify-between text-[11px] text-gray-500">
+          <div className="flex items-center gap-4">
+            <span className="flex items-center gap-1.5">
+              <span className="w-2 h-2 rounded-full bg-emerald-400" />
+              Web Audio Synthesizer: <strong className="text-gray-300 font-bold uppercase">{soundTheme}</strong>
+            </span>
+            <span>•</span>
+            <span>Taxa Ativa: <strong className="text-gray-300 font-mono font-bold">{fps} FPS</strong></span>
+            <span>•</span>
+            <span>Resolução: <strong className="text-gray-300 font-mono font-bold">1280x720 (HD)</strong></span>
+          </div>
+
+          <div className="text-[10px] text-gray-400 font-medium">
+            AI Studio Video Engine • Gemini Multimodal
+          </div>
         </div>
 
       </div>
